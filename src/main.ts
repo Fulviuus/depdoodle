@@ -78,6 +78,7 @@ interface GraphHistorySnapshot {
   };
   nodes: PuzzleNode[];
   edges: DependencyEdge[];
+  selectedNodeIds: string[];
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
 }
@@ -125,9 +126,26 @@ interface Rect {
 }
 
 interface DragState {
-  nodeId: string;
+  primaryNodeId: string;
+  nodeIds: string[];
+  startPoint: Point;
+  originPositions: Array<{
+    nodeId: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }>;
   offsetX: number;
   offsetY: number;
+}
+
+interface SelectionBoxState {
+  start: Point;
+  current: Point;
+  additive: boolean;
+  initialNodeIds: Set<string>;
+  hasMoved: boolean;
 }
 
 type EdgeSegmentOrientation = "horizontal" | "vertical" | "free";
@@ -261,11 +279,13 @@ let edges: DependencyEdge[] = [];
 let currentGraph: LoadedGraph | null = null;
 let recentGraphs: RecentGraph[] = loadRecentGraphs();
 
+let selectedNodeIds = new Set<string>();
 let selectedNodeId: string | null = null;
 let selectedEdgeId: string | null = null;
 let activeTool: Tool = "select";
 let pendingConnectionFrom: string | null = null;
 let dragState: DragState | null = null;
+let selectionBoxState: SelectionBoxState | null = null;
 let edgeRouteDragState: EdgeRouteDragState | null = null;
 let edgeLabelDragState: EdgeLabelDragState | null = null;
 let nodeSerial = nodes.length + 1;
@@ -623,7 +643,7 @@ graphSpace.addEventListener("pointerleave", () => {
 graphSpace.addEventListener("pointerdown", (event) => {
   const target = event.target as Element;
 
-  if (target.closest(".node") || target.closest(".edge-hit")) {
+  if (target.closest(".node") || target.closest(".edge-pick")) {
     return;
   }
 
@@ -635,9 +655,12 @@ graphSpace.addEventListener("pointerdown", (event) => {
     return;
   }
 
-  selectedNodeId = null;
-  selectedEdgeId = null;
-  pendingConnectionFrom = null;
+  if (activeTool === "select") {
+    beginSelectionBox(event, point);
+    return;
+  }
+
+  clearSelection();
   render();
 });
 
@@ -744,11 +767,66 @@ function setTool(tool: Tool) {
   render();
 }
 
+function isSelectionModifier(event: MouseEvent | PointerEvent) {
+  return event.shiftKey || event.metaKey || event.ctrlKey;
+}
+
+function selectOnlyNode(nodeId: string) {
+  selectedNodeIds = new Set([nodeId]);
+  selectedNodeId = nodeId;
+  selectedEdgeId = null;
+  pendingConnectionFrom = null;
+}
+
+function setSelectedNodes(nodeIds: Iterable<string>, primaryNodeId?: string) {
+  const knownNodeIds = new Set(nodes.map((node) => node.id));
+  selectedNodeIds = new Set([...nodeIds].filter((nodeId) => knownNodeIds.has(nodeId)));
+  selectedNodeId =
+    primaryNodeId && selectedNodeIds.has(primaryNodeId)
+      ? primaryNodeId
+      : nodes.find((node) => selectedNodeIds.has(node.id))?.id ?? null;
+
+  if (selectedNodeId) {
+    selectedEdgeId = null;
+  }
+}
+
+function toggleNodeSelection(nodeId: string) {
+  const nextSelection = new Set(selectedNodeIds);
+
+  if (nextSelection.has(nodeId)) {
+    nextSelection.delete(nodeId);
+  } else {
+    nextSelection.add(nodeId);
+  }
+
+  setSelectedNodes(nextSelection, nextSelection.has(nodeId) ? nodeId : undefined);
+}
+
+function selectOnlyEdge(edgeId: string) {
+  selectedNodeIds = new Set();
+  selectedNodeId = null;
+  selectedEdgeId = edgeId;
+  pendingConnectionFrom = null;
+}
+
+function clearSelection() {
+  selectedNodeIds = new Set();
+  selectedNodeId = null;
+  selectedEdgeId = null;
+  pendingConnectionFrom = null;
+}
+
+function syncPrimarySelection() {
+  setSelectedNodes(selectedNodeIds, selectedNodeId ?? undefined);
+}
+
 function captureGraphHistorySnapshot(): GraphHistorySnapshot {
   return {
     world: { ...world },
     nodes: nodes.map((node) => ({ ...node })),
     edges: edges.map(cloneEdge),
+    selectedNodeIds: [...selectedNodeIds],
     selectedNodeId,
     selectedEdgeId,
   };
@@ -757,14 +835,18 @@ function captureGraphHistorySnapshot(): GraphHistorySnapshot {
 function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
   nodes = snapshot.nodes.map((node) => ({ ...node }));
   edges = snapshot.edges.map(cloneEdge);
+  selectedNodeIds = new Set(snapshot.selectedNodeIds ?? (snapshot.selectedNodeId ? [snapshot.selectedNodeId] : []));
   selectedNodeId = snapshot.selectedNodeId;
   selectedEdgeId = snapshot.selectedEdgeId;
   pendingConnectionFrom = null;
   activeTool = "select";
   nodeGhostPosition = null;
   dragState = null;
+  selectionBoxState = null;
   edgeRouteDragState = null;
   edgeLabelDragState = null;
+  renderSelectionBox();
+  syncPrimarySelection();
   window.removeEventListener("pointermove", handleEdgeRouteDragMove);
   window.removeEventListener("pointermove", handleEdgeLabelDragMove);
   window.removeEventListener("pointerup", finishEdgeRouteDrag);
@@ -889,8 +971,7 @@ function addNodeAt(x: number, y: number) {
 
     nodeSerial += 1;
     nodes = [...nodes, node];
-    selectedNodeId = node.id;
-    selectedEdgeId = null;
+    selectOnlyNode(node.id);
     activeTool = "select";
     nodeGhostPosition = null;
     render();
@@ -915,8 +996,7 @@ function addDependency(from: string, to: string) {
 
     edgeSerial += 1;
     edges = [...edges, edge];
-    selectedNodeId = null;
-    selectedEdgeId = edge.id;
+    selectOnlyEdge(edge.id);
     pendingConnectionFrom = null;
     activeTool = "select";
     markGraphvizRoutingDirty();
@@ -958,7 +1038,7 @@ async function handleGraphFileInput() {
 function openGraphDocument(document: GraphDocumentV1, sourceName: string, updateRecent = true, filePath?: string) {
   const normalized = normalizeGraphDocument(document);
   nodes = normalized.nodes.map((node) => ({ ...node }));
-  edges = normalized.edges.map((edge) => ({ ...edge }));
+  edges = normalized.edges.map(cloneEdge);
   currentGraph = {
     title: normalized.title,
     sourceName,
@@ -967,11 +1047,11 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
   };
   nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
   edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
-  selectedNodeId = null;
-  selectedEdgeId = null;
-  pendingConnectionFrom = null;
+  clearSelection();
   activeTool = "select";
   nodeGhostPosition = null;
+  selectionBoxState = null;
+  renderSelectionBox();
   graphvizLayout = null;
   graphvizRoutingDirty = true;
   resetGraphHistory();
@@ -995,11 +1075,11 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
 
 function showWelcomeScreen() {
   currentGraph = null;
-  selectedNodeId = null;
-  selectedEdgeId = null;
-  pendingConnectionFrom = null;
+  clearSelection();
   activeTool = "select";
   nodeGhostPosition = null;
+  selectionBoxState = null;
+  renderSelectionBox();
   resetGraphHistory();
   setExportMenuOpen(false);
   render();
@@ -2584,18 +2664,18 @@ function applyGraphvizAutoLayout() {
 }
 
 function deleteSelection() {
-  if (selectedNodeId) {
+  if (selectedNodeIds.size > 0) {
     withGraphEdit(() => {
-      const nodeId = selectedNodeId;
+      const nodeIds = new Set(selectedNodeIds);
 
-      if (!nodeId) {
+      if (nodeIds.size === 0) {
         return;
       }
 
-      const affectsRouting = isRoutedNode(nodeId);
-      nodes = nodes.filter((node) => node.id !== nodeId);
-      edges = edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId);
-      selectedNodeId = null;
+      const affectsRouting = [...nodeIds].some(isRoutedNode);
+      nodes = nodes.filter((node) => !nodeIds.has(node.id));
+      edges = edges.filter((edge) => !nodeIds.has(edge.from) && !nodeIds.has(edge.to));
+      clearSelection();
       if (affectsRouting) {
         markGraphvizRoutingDirty();
       }
@@ -2613,7 +2693,7 @@ function deleteSelection() {
       }
 
       edges = edges.filter((edge) => edge.id !== edgeId);
-      selectedEdgeId = null;
+      clearSelection();
       markGraphvizRoutingDirty();
       render();
     });
@@ -2635,6 +2715,7 @@ function render() {
   renderToolbar();
   renderEdges();
   renderNodes();
+  renderSelectionBox();
   renderMetrics(analysis);
   renderWidthBars(analysis);
   renderWarnings(analysis);
@@ -2722,7 +2803,7 @@ function renderNodes() {
     .map((node) => {
       const incoming = incomingEdges(node.id).length;
       const outgoing = outgoingEdges(node.id).length;
-      const selected = node.id === selectedNodeId ? " selected" : "";
+      const selected = selectedNodeIds.has(node.id) ? " selected" : "";
       const pending = node.id === pendingConnectionFrom ? " pending-connect" : "";
       const role = roots.has(node.id) ? "Root" : leaves.has(node.id) ? "Leaf" : "Linked";
       const difficultyMarkup =
@@ -2802,6 +2883,30 @@ function renderNodeGhost() {
       <span>0 out</span>
     </div>
   `;
+}
+
+function renderSelectionBox() {
+  const existingBox = graphSpace.querySelector<HTMLElement>(".selection-box");
+
+  if (!selectionBoxState?.hasMoved) {
+    existingBox?.remove();
+    return;
+  }
+
+  const rect = rectFromPoints(selectionBoxState.start, selectionBoxState.current);
+  const box =
+    existingBox ??
+    (() => {
+      const element = document.createElement("div");
+      element.className = "selection-box";
+      graphSpace.appendChild(element);
+      return element;
+    })();
+
+  box.style.left = `${rect.left}px`;
+  box.style.top = `${rect.top}px`;
+  box.style.width = `${rect.right - rect.left}px`;
+  box.style.height = `${rect.bottom - rect.top}px`;
 }
 
 function renderEdges() {
@@ -2914,8 +3019,38 @@ function renderWarnings(analysis: GraphAnalysis) {
 }
 
 function renderInspector() {
-  const selectedNode = selectedNodeId ? getNode(selectedNodeId) : null;
+  const selectedNodes = nodes.filter((node) => selectedNodeIds.has(node.id));
+  const selectedNode = selectedNodes.length === 1 ? selectedNodes[0] : null;
   const selectedEdge = selectedEdgeId ? edges.find((edge) => edge.id === selectedEdgeId) : null;
+
+  if (selectedNodes.length > 1) {
+    const selectedIds = new Set(selectedNodes.map((node) => node.id));
+    const incoming = edges.filter((edge) => !selectedIds.has(edge.from) && selectedIds.has(edge.to)).length;
+    const outgoing = edges.filter((edge) => selectedIds.has(edge.from) && !selectedIds.has(edge.to)).length;
+    const internal = edges.filter((edge) => selectedIds.has(edge.from) && selectedIds.has(edge.to)).length;
+
+    inspector.innerHTML = `
+      <div class="relationship-list">
+        <h3>Selection</h3>
+        <p>${selectedNodes.length} nodes</p>
+        <h3>External Prerequisites</h3>
+        <p>${incoming}</p>
+        <h3>External Unlocks</h3>
+        <p>${outgoing}</p>
+        <h3>Internal Dependencies</h3>
+        <p>${internal}</p>
+      </div>
+      <button class="danger-button" id="delete-selection" type="button">
+        <i data-lucide="trash-2"></i>
+        <span>Delete Nodes</span>
+      </button>
+    `;
+
+    must<HTMLButtonElement>("#delete-selection").addEventListener("click", () => {
+      deleteSelection();
+    });
+    return;
+  }
 
   if (selectedNode) {
     const prerequisites = incomingEdges(selectedNode.id)
@@ -3127,13 +3262,92 @@ function bindGraphEditTransaction(element: HTMLElement) {
   });
 }
 
+function beginSelectionBox(event: PointerEvent, point: Point) {
+  if (event.button !== 0) {
+    return;
+  }
+
+  event.preventDefault();
+  selectionBoxState = {
+    start: point,
+    current: point,
+    additive: isSelectionModifier(event),
+    initialNodeIds: new Set(selectedNodeIds),
+    hasMoved: false,
+  };
+
+  window.addEventListener("pointermove", handleSelectionBoxMove);
+  window.addEventListener("pointerup", finishSelectionBox, { once: true });
+}
+
+function handleSelectionBoxMove(event: PointerEvent) {
+  if (!selectionBoxState) {
+    return;
+  }
+
+  selectionBoxState.current = getCanvasPoint(event.clientX, event.clientY);
+  selectionBoxState.hasMoved ||= distanceBetween(selectionBoxState.start, selectionBoxState.current) > 4;
+
+  if (!selectionBoxState.hasMoved) {
+    return;
+  }
+
+  const selectedByBox = nodesInRect(rectFromPoints(selectionBoxState.start, selectionBoxState.current));
+  const nextSelection = selectionBoxState.additive
+    ? new Set([...selectionBoxState.initialNodeIds, ...selectedByBox])
+    : new Set(selectedByBox);
+
+  setSelectedNodes(nextSelection);
+  renderNodes();
+  renderEdges();
+  renderInspector();
+  renderSelectionBox();
+}
+
+function finishSelectionBox() {
+  const state = selectionBoxState;
+  selectionBoxState = null;
+  window.removeEventListener("pointermove", handleSelectionBoxMove);
+
+  if (state && !state.hasMoved && !state.additive) {
+    clearSelection();
+  }
+
+  renderSelectionBox();
+  render();
+}
+
+function nodesInRect(rect: Rect) {
+  return nodes
+    .filter((node) =>
+      rectsIntersect(rect, {
+        left: node.x,
+        top: node.y,
+        right: node.x + node.width,
+        bottom: node.y + node.height,
+      }),
+    )
+    .map((node) => node.id);
+}
+
+function rectFromPoints(start: Point, end: Point): Rect {
+  return {
+    left: Math.min(start.x, end.x),
+    top: Math.min(start.y, end.y),
+    right: Math.max(start.x, end.x),
+    bottom: Math.max(start.y, end.y),
+  };
+}
+
+function rectsIntersect(a: Rect, b: Rect) {
+  return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
+
 function beginEdgeRouteDrag(event: PointerEvent, edgeId: string) {
   const edge = getEdge(edgeId);
   const route = edge ? routeForEdge(edge) : null;
 
-  selectedEdgeId = edgeId;
-  selectedNodeId = null;
-  pendingConnectionFrom = null;
+  selectOnlyEdge(edgeId);
 
   if (!edge || !route) {
     render();
@@ -3186,9 +3400,7 @@ function beginEdgeLabelDrag(event: PointerEvent, edgeId: string) {
   const edge = getEdge(edgeId);
   const route = edge ? routeForEdge(edge) : null;
 
-  selectedEdgeId = edgeId;
-  selectedNodeId = null;
-  pendingConnectionFrom = null;
+  selectOnlyEdge(edgeId);
 
   if (!edge || !route) {
     render();
@@ -3263,8 +3475,7 @@ function handleNodePointerDown(event: PointerEvent, nodeId: string) {
   if (activeTool === "connect") {
     if (!pendingConnectionFrom) {
       pendingConnectionFrom = nodeId;
-      selectedNodeId = nodeId;
-      selectedEdgeId = null;
+      selectOnlyNode(nodeId);
       render();
       return;
     }
@@ -3273,8 +3484,19 @@ function handleNodePointerDown(event: PointerEvent, nodeId: string) {
     return;
   }
 
-  selectedNodeId = nodeId;
-  selectedEdgeId = null;
+  if (isSelectionModifier(event)) {
+    toggleNodeSelection(nodeId);
+    render();
+    return;
+  }
+
+  if (selectedNodeIds.has(nodeId)) {
+    selectedNodeId = nodeId;
+    selectedEdgeId = null;
+  } else {
+    selectOnlyNode(nodeId);
+  }
+
   pendingConnectionFrom = null;
 
   const node = getNode(nodeId);
@@ -3284,10 +3506,25 @@ function handleNodePointerDown(event: PointerEvent, nodeId: string) {
   }
 
   const point = getCanvasPoint(event.clientX, event.clientY);
+  const nodeIds = selectedNodeIds.has(nodeId) ? [...selectedNodeIds] : [nodeId];
+  const originPositions = nodeIds
+    .map((selectedId) => getNode(selectedId))
+    .filter((selectedNode): selectedNode is PuzzleNode => selectedNode !== undefined)
+    .map((selectedNode) => ({
+      nodeId: selectedNode.id,
+      x: selectedNode.x,
+      y: selectedNode.y,
+      width: selectedNode.width,
+      height: selectedNode.height,
+    }));
+
   beginGraphEdit();
 
   dragState = {
-    nodeId,
+    primaryNodeId: nodeId,
+    nodeIds: originPositions.map((position) => position.nodeId),
+    startPoint: point,
+    originPositions,
     offsetX: point.x - node.x,
     offsetY: point.y - node.y,
   };
@@ -3303,17 +3540,39 @@ function handleDragMove(event: PointerEvent) {
   }
 
   const point = getCanvasPoint(event.clientX, event.clientY);
-  const position = positionNodeForDrag(point.x - dragState.offsetX, point.y - dragState.offsetY);
+  const primaryOrigin = dragState.originPositions.find((position) => position.nodeId === dragState?.primaryNodeId);
 
-  updateNode(dragState.nodeId, {
-    x: position.x,
-    y: position.y,
+  if (!primaryOrigin) {
+    return;
+  }
+
+  const primaryPosition = positionNodeForDrag(point.x - dragState.offsetX, point.y - dragState.offsetY);
+  const desiredDelta = {
+    x: primaryPosition.x - primaryOrigin.x,
+    y: primaryPosition.y - primaryOrigin.y,
+  };
+  const delta = clampGroupDragDelta(desiredDelta, dragState.originPositions);
+  const positionsByNodeId = new Map(
+    dragState.originPositions.map((position) => [
+      position.nodeId,
+      {
+        x: position.x + delta.x,
+        y: position.y + delta.y,
+      },
+    ]),
+  );
+
+  nodes = nodes.map((node) => {
+    const position = positionsByNodeId.get(node.id);
+
+    return position ? { ...node, ...position } : node;
   });
 
-  if (isRoutedNode(dragState.nodeId)) {
+  if (dragState.nodeIds.some(isRoutedNode)) {
     markGraphvizRoutingDirty();
     refreshGraphvizRoutingIfNeeded();
   }
+
   renderEdges();
   renderNodes();
 }
@@ -4263,6 +4522,29 @@ function positionNodeForDrag(x: number, y: number): Point {
   return {
     x: snapCoordinateWithin(x, 30, world.width - 250),
     y: snapCoordinateWithin(y, 42, world.height - 150),
+  };
+}
+
+function clampGroupDragDelta(
+  delta: Point,
+  positions: Array<{ x: number; y: number; width: number; height: number }>,
+): Point {
+  if (positions.length === 0) {
+    return delta;
+  }
+
+  const minDeltaX = Math.max(...positions.map((position) => 30 - position.x));
+  const maxDeltaX = Math.min(
+    ...positions.map((position) => world.width - Math.max(250, position.width + 40) - position.x),
+  );
+  const minDeltaY = Math.max(...positions.map((position) => 42 - position.y));
+  const maxDeltaY = Math.min(
+    ...positions.map((position) => world.height - Math.max(150, position.height + 32) - position.y),
+  );
+
+  return {
+    x: clamp(delta.x, minDeltaX, maxDeltaX),
+    y: clamp(delta.y, minDeltaY, maxDeltaY),
   };
 }
 

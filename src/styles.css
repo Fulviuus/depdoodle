@@ -826,6 +826,15 @@ button {
   pointer-events: none;
 }
 
+.selection-box {
+  position: absolute;
+  z-index: 3;
+  border: 1px solid var(--md-primary);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--md-primary) 14%, transparent);
+  pointer-events: none;
+}
+
 .edge-path {
   fill: none;
   stroke: var(--edge-color);
