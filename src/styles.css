@@ -388,6 +388,10 @@ button {
   display: none;
 }
 
+.app-shell.is-welcome .brand {
+  visibility: hidden;
+}
+
 .welcome-screen {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) 320px;
@@ -503,10 +507,34 @@ button {
 }
 
 .recent-heading h2 {
+  flex: 1;
   margin: 0;
   color: var(--md-on-surface);
   font-size: 16px;
   font-weight: 600;
+}
+
+.recent-clear,
+.recent-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 50%;
+  color: var(--md-on-surface-variant);
+  background: transparent;
+}
+
+.recent-clear:hover,
+.recent-delete:hover {
+  color: var(--md-on-error-container);
+  background: var(--md-error-container);
+}
+
+.recent-clear[hidden] {
+  display: none;
 }
 
 .recent-list {
@@ -519,12 +547,13 @@ button {
 
 .recent-item {
   display: grid;
-  gap: 4px;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 6px;
   width: 100%;
-  padding: 12px;
+  padding: 4px;
   border: 0;
   border-radius: 8px;
-  text-align: left;
   color: var(--md-on-surface);
   background: var(--md-surface-container);
 }
@@ -533,7 +562,23 @@ button {
   background: var(--md-secondary-container);
 }
 
-.recent-item strong {
+.recent-open {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.recent-open:hover {
+  background: var(--state-hover);
+}
+
+.recent-open strong {
   overflow: hidden;
   font-size: 13px;
   font-weight: 600;
@@ -541,7 +586,7 @@ button {
   white-space: nowrap;
 }
 
-.recent-item span,
+.recent-open span,
 .recent-empty {
   color: var(--md-on-surface-variant);
   font-size: 12px;

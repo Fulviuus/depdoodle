@@ -31,7 +31,7 @@ import { writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
 type NodeKind = "puzzle" | "gate" | "reward";
 type Tool = "select" | "node" | "connect";
 type ThemeMode = "light" | "dark";
-type ExportFormat = "png" | "jpg" | "pdf";
+type ExportFormat = "png" | "jpg" | "pdf" | "svg";
 
 interface PuzzleNode {
   id: string;
@@ -77,6 +77,20 @@ interface GraphHistorySnapshot {
   edges: DependencyEdge[];
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
+}
+
+interface ExportBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+interface RasterExport {
+  canvas: HTMLCanvasElement;
+  bounds: ExportBounds;
 }
 
 interface LoadedGraph {
@@ -208,7 +222,9 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 2.5;
 const ZOOM_STEP = 1.2;
 const EXPORT_PADDING = 56;
-const MAX_EXPORT_PIXELS = 24_000_000;
+const EXPORT_RASTER_SCALE = 2;
+const MAX_EXPORT_PIXELS = 96_000_000;
+const EXPORT_FONT_FAMILY = 'Roboto, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
 const RECENT_GRAPHS_STORAGE_KEY = "depdoodle.recentGraphs";
 const THEME_STORAGE_KEY = "depdoodle.theme";
 const EMPTY_GRAPH_WORLD = { width: 1680, height: 1040 };
@@ -275,6 +291,7 @@ app.innerHTML = `
             <button type="button" role="menuitem" data-export-format="png">PNG</button>
             <button type="button" role="menuitem" data-export-format="jpg">JPG</button>
             <button type="button" role="menuitem" data-export-format="pdf">PDF</button>
+            <button type="button" role="menuitem" data-export-format="svg">SVG</button>
           </div>
         </div>
         <span class="toolbar-separator" aria-hidden="true"></span>
@@ -331,7 +348,7 @@ app.innerHTML = `
     <main class="welcome-screen" id="welcome-screen">
       <section class="welcome-main">
         <img class="welcome-logo" src="/depdoodle-logo.png" alt="DepDoodle" />
-        <h1>Puzzle dependency charts</h1>
+        <h1>Puzzle dependency charts editor</h1>
         <p class="welcome-copy">Create a chart, load a saved <code>.depdoodle</code> graph, or reopen recent work.</p>
         <div class="welcome-actions">
           <button class="welcome-action primary" id="new-graph" type="button">
@@ -349,6 +366,9 @@ app.innerHTML = `
         <div class="recent-heading">
           <i data-lucide="history"></i>
           <h2>Recent Files</h2>
+          <button class="recent-clear" id="clear-recent" type="button" title="Clear recent files" aria-label="Clear recent files">
+            <i data-lucide="trash-2"></i>
+          </button>
         </div>
         <div class="recent-list" id="recent-list"></div>
       </aside>
@@ -434,6 +454,7 @@ const exportButton = must<HTMLButtonElement>("#export-graph");
 const exportMenu = must<HTMLDivElement>("#export-menu");
 const undoButton = must<HTMLButtonElement>("#undo-graph");
 const redoButton = must<HTMLButtonElement>("#redo-graph");
+const clearRecentButton = must<HTMLButtonElement>("#clear-recent");
 
 resizeWorld(world.width, world.height);
 applyTheme(themeMode);
@@ -448,6 +469,10 @@ must<HTMLButtonElement>("#load-graph").addEventListener("click", () => {
 
 graphFileInput.addEventListener("change", () => {
   void handleGraphFileInput();
+});
+
+clearRecentButton.addEventListener("click", () => {
+  clearRecentGraphs();
 });
 
 must<HTMLButtonElement>("#back-to-welcome").addEventListener("click", () => {
@@ -1012,8 +1037,7 @@ async function exportGraph(format: ExportFormat) {
         return;
       }
 
-      const canvas = renderGraphToCanvas();
-      const blob = await blobForExportFormat(canvas, format);
+      const blob = await blobForExportFormat(format);
       await writeFile(
         ensureFileExtension(filePath, extension, acceptedExtensionsForExportFormat(format)),
         new Uint8Array(await blob.arrayBuffer()),
@@ -1021,19 +1045,7 @@ async function exportGraph(format: ExportFormat) {
       return;
     }
 
-    const canvas = renderGraphToCanvas();
-
-    if (format === "png") {
-      downloadBlob(await blobForExportFormat(canvas, format), filename);
-      return;
-    }
-
-    if (format === "jpg") {
-      downloadBlob(await blobForExportFormat(canvas, format), filename);
-      return;
-    }
-
-    downloadBlob(await blobForExportFormat(canvas, format), filename);
+    downloadBlob(await blobForExportFormat(format), filename);
   } catch (error) {
     window.alert(error instanceof Error ? error.message : "Unable to export chart.");
   }
@@ -1051,7 +1063,7 @@ function createGraphDocument(): GraphDocumentV1 {
   };
 }
 
-function renderGraphToCanvas() {
+function renderGraphToCanvas(): RasterExport {
   refreshGraphvizRoutingIfNeeded();
 
   const bounds = measureExportBounds();
@@ -1072,10 +1084,10 @@ function renderGraphToCanvas() {
   drawExportEdges(context);
   drawExportNodes(context);
 
-  return canvas;
+  return { canvas, bounds };
 }
 
-function measureExportBounds() {
+function measureExportBounds(): ExportBounds {
   const xs: number[] = [];
   const ys: number[] = [];
 
@@ -1136,15 +1148,12 @@ function measureExportBounds() {
 
 function exportScale(width: number, height: number) {
   const pixels = width * height;
+  const maxScale = Math.sqrt(MAX_EXPORT_PIXELS / pixels);
 
-  if (pixels <= MAX_EXPORT_PIXELS) {
-    return 1;
-  }
-
-  return Math.sqrt(MAX_EXPORT_PIXELS / pixels);
+  return Math.min(EXPORT_RASTER_SCALE, maxScale);
 }
 
-function drawExportBackground(context: CanvasRenderingContext2D, bounds: ReturnType<typeof measureExportBounds>) {
+function drawExportBackground(context: CanvasRenderingContext2D, bounds: ExportBounds) {
   const styles = exportStyles();
   context.fillStyle = styles.surface;
   context.fillRect(bounds.left, bounds.top, bounds.width, bounds.height);
@@ -1182,8 +1191,8 @@ function drawExportEdges(context: CanvasRenderingContext2D) {
     context.save();
     context.strokeStyle = styles.edge;
     context.lineWidth = 2.2;
-    context.lineCap = "round";
-    context.lineJoin = "round";
+    context.lineCap = "butt";
+    context.lineJoin = "miter";
     context.stroke(new Path2D(route.path));
     context.restore();
 
@@ -1415,6 +1424,67 @@ function ellipsizeText(context: CanvasRenderingContext2D, text: string, maxWidth
   return `${output.trimEnd()}...`;
 }
 
+function wrapTextLinesForFont(text: string, maxWidth: number, font: string, maxLines: number) {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+
+  if (words.length === 0 || maxLines <= 0) {
+    return [];
+  }
+
+  const lines: string[] = [];
+  let currentLine = "";
+
+  words.forEach((word) => {
+    const candidate = currentLine ? `${currentLine} ${word}` : word;
+
+    if (measureExportText(candidate, font) <= maxWidth || !currentLine) {
+      currentLine = candidate;
+      return;
+    }
+
+    lines.push(currentLine);
+    currentLine = word;
+  });
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines
+    .slice(0, maxLines)
+    .map((line, index) => {
+      const isLastVisibleLine = index === maxLines - 1 && lines.length > maxLines;
+      return ellipsizeTextForFont(isLastVisibleLine ? `${line}...` : line, maxWidth, font);
+    });
+}
+
+function ellipsizeTextForFont(text: string, maxWidth: number, font: string) {
+  if (measureExportText(text, font) <= maxWidth) {
+    return text;
+  }
+
+  let output = text.replace(/\.*$/, "");
+
+  while (output.length > 0 && measureExportText(`${output}...`, font) > maxWidth) {
+    output = output.slice(0, -1);
+  }
+
+  return `${output.trimEnd()}...`;
+}
+
+function measureExportText(text: string, font: string) {
+  if (!edgeLabelMeasureContext) {
+    edgeLabelMeasureContext = document.createElement("canvas").getContext("2d");
+  }
+
+  if (!edgeLabelMeasureContext) {
+    return text.length * 7.2;
+  }
+
+  edgeLabelMeasureContext.font = font;
+  return edgeLabelMeasureContext.measureText(text).width;
+}
+
 function exportRouteForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
   const graphvizRoute = graphvizLayout?.edges.get(edge.id);
 
@@ -1472,6 +1542,195 @@ function pathPointsFromSvgPath(path: string) {
   }
 
   return points;
+}
+
+function renderGraphToSvgBlob() {
+  refreshGraphvizRoutingIfNeeded();
+
+  return new Blob([renderGraphToSvg(measureExportBounds())], {
+    type: "image/svg+xml;charset=utf-8",
+  });
+}
+
+function renderGraphToSvg(bounds: ExportBounds) {
+  const styles = exportStyles();
+  const isDark = document.documentElement.dataset.theme === "dark";
+  const shadowOpacity = isDark ? 0.36 : 0.18;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.left} ${bounds.top} ${bounds.width} ${bounds.height}">
+  <defs>
+    <filter id="node-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="${shadowOpacity}" />
+    </filter>
+  </defs>
+  <rect x="${bounds.left}" y="${bounds.top}" width="${bounds.width}" height="${bounds.height}" fill="${escapeAttribute(styles.surface)}" />
+  ${svgGrid(bounds, styles)}
+  ${svgEdges(styles)}
+  ${svgNodes(styles)}
+</svg>
+`;
+}
+
+function svgGrid(bounds: ExportBounds, styles: ReturnType<typeof exportStyles>) {
+  const lines: string[] = [];
+  const startX = Math.floor(bounds.left / 24) * 24;
+  const startY = Math.floor(bounds.top / 24) * 24;
+
+  for (let x = startX; x <= bounds.right; x += 24) {
+    lines.push(`<line x1="${x}" y1="${bounds.top}" x2="${x}" y2="${bounds.bottom}" />`);
+  }
+
+  for (let y = startY; y <= bounds.bottom; y += 24) {
+    lines.push(`<line x1="${bounds.left}" y1="${y}" x2="${bounds.right}" y2="${y}" />`);
+  }
+
+  return `<g stroke="${escapeAttribute(styles.grid)}" stroke-width="1" shape-rendering="crispEdges">${lines.join("")}</g>`;
+}
+
+function svgEdges(styles: ReturnType<typeof exportStyles>) {
+  const edgeLines = edges
+    .map((edge) => {
+      const route = exportRouteForEdge(edge);
+
+      if (!route) {
+        return "";
+      }
+
+      const arrow = route.arrowPoints.length
+        ? `<polygon points="${route.arrowPoints.map((point) => `${round(point.x)},${round(point.y)}`).join(" ")}" fill="${escapeAttribute(styles.edge)}" />`
+        : "";
+
+      return `<g>
+        <path d="${escapeAttribute(route.path)}" fill="none" stroke="${escapeAttribute(styles.edge)}" stroke-width="2.2" stroke-linecap="butt" stroke-linejoin="miter" />
+        ${arrow}
+      </g>`;
+    })
+    .join("");
+  const edgeLabels = edges
+    .map((edge) => {
+      const route = exportRouteForEdge(edge);
+      const label = edge.label.trim();
+
+      if (!route || !label) {
+        return "";
+      }
+
+      const metrics = measureEdgeLabel(label);
+      const text = ellipsizeTextForFont(label, metrics.width - 16, exportFont(12, 500));
+
+      return `<g>
+        <rect x="${round(route.labelX - metrics.width / 2)}" y="${round(route.labelY - metrics.height / 2)}" width="${metrics.width}" height="${metrics.height}" rx="6" fill="${escapeAttribute(styles.edgeLabelSurface)}" stroke="${escapeAttribute(styles.outlineVariant)}" />
+        <text x="${round(route.labelX)}" y="${round(route.labelY + 1)}" fill="${escapeAttribute(styles.textVariant)}" font-family="${escapeAttribute(EXPORT_FONT_FAMILY)}" font-size="12" font-weight="500" text-anchor="middle" dominant-baseline="middle">${escapeHtml(text)}</text>
+      </g>`;
+    })
+    .join("");
+
+  return `<g>${edgeLines}${edgeLabels}</g>`;
+}
+
+function svgNodes(styles: ReturnType<typeof exportStyles>) {
+  const analysis = analyzeGraph();
+  const roots = new Set(analysis.roots.map((node) => node.id));
+  const leaves = new Set(analysis.leaves.map((node) => node.id));
+
+  return [...nodes]
+    .sort(compareNodesByPosition)
+    .map((node, index) => {
+      const nodeColorValue = nodeColor(node);
+      const nodeSurface = mixCssColors(nodeColorValue, styles.nodeSurfaceTint, styles.surfaceLowest);
+      const borderColor = mixCssColors(nodeColorValue, 0.24, styles.outlineVariant);
+      const role = roots.has(node.id) ? "Root" : leaves.has(node.id) ? "Leaf" : "Linked";
+      const incoming = incomingEdges(node.id).length;
+      const outgoing = outgoingEdges(node.id).length;
+      const clipId = `node-clip-${index}`;
+
+      return `<g>
+        <rect x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="8" fill="${escapeAttribute(nodeSurface)}" stroke="${escapeAttribute(borderColor)}" filter="url(#node-shadow)" />
+        <clipPath id="${clipId}"><rect x="${node.x}" y="${node.y}" width="${node.width}" height="${node.height}" rx="8" /></clipPath>
+        <g clip-path="url(#${clipId})">
+          ${svgNodeTopline(node, role, nodeColorValue, styles)}
+          ${svgNodeBody(node, styles)}
+          ${svgNodeFooter(node, incoming, outgoing, styles)}
+        </g>
+      </g>`;
+    })
+    .join("");
+}
+
+function svgNodeTopline(
+  node: PuzzleNode,
+  role: string,
+  nodeColorValue: string,
+  styles: ReturnType<typeof exportStyles>,
+) {
+  const x = node.x + 12;
+  const y = node.y + 13;
+
+  return `<g>
+    <circle cx="${x + 9}" cy="${y + 9}" r="8" fill="${escapeAttribute(nodeColorValue)}" stroke="${escapeAttribute(styles.swatchBorder)}" stroke-width="2" />
+    <text x="${x + 27}" y="${y + 9}" fill="${escapeAttribute(styles.textVariant)}" font-family="${escapeAttribute(EXPORT_FONT_FAMILY)}" font-size="11" font-weight="500" dominant-baseline="middle">${escapeHtml(labelForKind(node.kind))}</text>
+    <text x="${node.x + node.width - 12}" y="${y + 9}" fill="${escapeAttribute(styles.textVariant)}" font-family="${escapeAttribute(EXPORT_FONT_FAMILY)}" font-size="11" font-weight="500" text-anchor="end" dominant-baseline="middle">${escapeHtml(role)}</text>
+  </g>`;
+}
+
+function svgNodeBody(node: PuzzleNode, styles: ReturnType<typeof exportStyles>) {
+  const contentX = node.x + 12;
+  const contentWidth = node.width - 24;
+  const titleFont = exportFont(14, 700);
+  const noteFont = exportFont(11, 400);
+  const titleLines = wrapTextLinesForFont(node.title, contentWidth, titleFont, 2);
+  const noteY = node.y + 42 + titleLines.length * 17;
+  const footerTop = node.y + node.height - 35;
+  const availableNoteLines = Math.max(0, Math.floor((footerTop - noteY - 4) / 14));
+  const noteLines = availableNoteLines > 0
+    ? wrapTextLinesForFont(node.note, contentWidth, noteFont, availableNoteLines)
+    : [];
+
+  return `<g>
+    ${svgTextBlock(titleLines, contentX, node.y + 53, 17, styles.text, 14, 700, "start")}
+    ${svgTextBlock(noteLines, contentX, noteY + 11, 14, styles.textVariant, 11, 400, "start")}
+  </g>`;
+}
+
+function svgNodeFooter(
+  node: PuzzleNode,
+  incoming: number,
+  outgoing: number,
+  styles: ReturnType<typeof exportStyles>,
+) {
+  const y = node.y + node.height - 28;
+  const difficulty = typeof node.difficulty === "number"
+    ? `<text x="${node.x + node.width - 12}" y="${y}" text-anchor="end">${escapeHtml(`Difficulty ${node.difficulty}`)}</text>`
+    : "";
+
+  return `<g fill="${escapeAttribute(styles.textVariant)}" font-family="${escapeAttribute(EXPORT_FONT_FAMILY)}" font-size="11" font-weight="500" dominant-baseline="middle">
+    <line x1="${node.x + 12}" y1="${node.y + node.height - 35}" x2="${node.x + node.width - 12}" y2="${node.y + node.height - 35}" stroke="${escapeAttribute(styles.outlineVariant)}" stroke-width="1" />
+    <text x="${node.x + 12}" y="${y}">${incoming} in</text>
+    <text x="${node.x + node.width / 2}" y="${y}" text-anchor="middle">${outgoing} out</text>
+    ${difficulty}
+  </g>`;
+}
+
+function svgTextBlock(
+  lines: string[],
+  x: number,
+  y: number,
+  lineHeight: number,
+  fill: string,
+  fontSize: number,
+  fontWeight: number,
+  textAnchor: "start" | "middle" | "end",
+) {
+  if (lines.length === 0) {
+    return "";
+  }
+
+  const tspans = lines
+    .map((line, index) => `<tspan x="${x}" y="${y + index * lineHeight}">${escapeHtml(line)}</tspan>`)
+    .join("");
+
+  return `<text fill="${escapeAttribute(fill)}" font-family="${escapeAttribute(EXPORT_FONT_FAMILY)}" font-size="${fontSize}" font-weight="${fontWeight}" text-anchor="${textAnchor}">${tspans}</text>`;
 }
 
 function exportStyles() {
@@ -1554,7 +1813,7 @@ function parseCssColorChannel(value: string) {
 }
 
 function exportFont(size: number, weight: number) {
-  return `${weight} ${size}px Roboto, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  return `${weight} ${size}px ${EXPORT_FONT_FAMILY}`;
 }
 
 function roundedRect(context: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number) {
@@ -1589,14 +1848,26 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   });
 }
 
-async function canvasToPdfBlob(canvas: HTMLCanvasElement) {
-  const jpegBlob = await canvasToBlob(canvas, "image/jpeg", 0.92);
-  return singleImagePdfBlob(new Uint8Array(await jpegBlob.arrayBuffer()), canvas.width, canvas.height);
+async function canvasToPdfBlob(raster: RasterExport) {
+  const jpegBlob = await canvasToBlob(raster.canvas, "image/jpeg", 0.98);
+  return singleImagePdfBlob(
+    new Uint8Array(await jpegBlob.arrayBuffer()),
+    raster.canvas.width,
+    raster.canvas.height,
+    raster.bounds.width,
+    raster.bounds.height,
+  );
 }
 
-function singleImagePdfBlob(jpegBytes: Uint8Array, imageWidth: number, imageHeight: number) {
-  const pageWidth = round(imageWidth * 0.75);
-  const pageHeight = round(imageHeight * 0.75);
+function singleImagePdfBlob(
+  jpegBytes: Uint8Array,
+  imageWidth: number,
+  imageHeight: number,
+  logicalWidth: number,
+  logicalHeight: number,
+) {
+  const pageWidth = round(logicalWidth * 0.75);
+  const pageHeight = round(logicalHeight * 0.75);
   const encoder = new TextEncoder();
   const parts: Uint8Array[] = [];
   const offsets: number[] = [0];
@@ -1649,16 +1920,22 @@ function singleImagePdfBlob(jpegBytes: Uint8Array, imageWidth: number, imageHeig
   return new Blob(parts, { type: "application/pdf" });
 }
 
-function blobForExportFormat(canvas: HTMLCanvasElement, format: ExportFormat) {
+function blobForExportFormat(format: ExportFormat) {
+  if (format === "svg") {
+    return renderGraphToSvgBlob();
+  }
+
+  const raster = renderGraphToCanvas();
+
   if (format === "png") {
-    return canvasToBlob(canvas, "image/png");
+    return canvasToBlob(raster.canvas, "image/png");
   }
 
   if (format === "jpg") {
-    return canvasToBlob(canvas, "image/jpeg", 0.92);
+    return canvasToBlob(raster.canvas, "image/jpeg", 0.96);
   }
 
-  return canvasToPdfBlob(canvas);
+  return canvasToPdfBlob(raster);
 }
 
 function isTauriRuntime() {
@@ -1666,7 +1943,7 @@ function isTauriRuntime() {
 }
 
 function extensionForExportFormat(format: ExportFormat) {
-  return format === "pdf" ? "pdf" : format;
+  return format;
 }
 
 function acceptedExtensionsForExportFormat(format: ExportFormat) {
@@ -1680,6 +1957,10 @@ function filterForExportFormat(format: ExportFormat) {
 
   if (format === "jpg") {
     return { name: "JPEG Image", extensions: ["jpg", "jpeg"] };
+  }
+
+  if (format === "svg") {
+    return { name: "SVG Vector Image", extensions: ["svg"] };
   }
 
   return { name: "PDF Document", extensions: ["pdf"] };
@@ -1731,7 +2012,7 @@ function graphFilenameBase(title: string, sourceName: string) {
 }
 
 function isExportFormat(value: unknown): value is ExportFormat {
-  return value === "png" || value === "jpg" || value === "pdf";
+  return value === "png" || value === "jpg" || value === "pdf" || value === "svg";
 }
 
 function autoArrange() {
@@ -1870,6 +2151,8 @@ function renderAppMode() {
 }
 
 function renderWelcome() {
+  clearRecentButton.hidden = recentGraphs.length === 0;
+
   if (recentGraphs.length === 0) {
     recentList.innerHTML = `
       <p class="recent-empty">No recent graphs yet. Start a new graph or load a graph file.</p>
@@ -1880,17 +2163,22 @@ function renderWelcome() {
   recentList.innerHTML = recentGraphs
     .map(
       (recent) => `
-        <button class="recent-item" type="button" data-recent-id="${escapeAttribute(recent.id)}">
-          <strong>${escapeHtml(recent.title)}</strong>
-          <span>${escapeHtml(recent.sourceName)}</span>
-        </button>
+        <div class="recent-item" data-recent-id="${escapeAttribute(recent.id)}">
+          <button class="recent-open" type="button" data-recent-open="${escapeAttribute(recent.id)}">
+            <strong>${escapeHtml(recent.title)}</strong>
+            <span>${escapeHtml(recent.sourceName)}</span>
+          </button>
+          <button class="recent-delete" type="button" data-recent-delete="${escapeAttribute(recent.id)}" title="Remove from recent files" aria-label="Remove ${escapeAttribute(recent.title)} from recent files">
+            <i data-lucide="trash-2"></i>
+          </button>
+        </div>
       `,
     )
     .join("");
 
-  recentList.querySelectorAll<HTMLButtonElement>(".recent-item").forEach((button) => {
+  recentList.querySelectorAll<HTMLButtonElement>(".recent-open").forEach((button) => {
     button.addEventListener("click", () => {
-      const recent = recentGraphs.find((candidate) => candidate.id === button.dataset.recentId);
+      const recent = recentGraphs.find((candidate) => candidate.id === button.dataset.recentOpen);
 
       if (!recent) {
         return;
@@ -1898,6 +2186,18 @@ function renderWelcome() {
 
       openGraphDocument(recent.document, recent.sourceName, false, recent.filePath);
       rememberGraph(recent.document, recent.sourceName, recent.filePath);
+    });
+  });
+
+  recentList.querySelectorAll<HTMLButtonElement>(".recent-delete").forEach((button) => {
+    button.addEventListener("click", () => {
+      const recentId = button.dataset.recentDelete;
+
+      if (!recentId) {
+        return;
+      }
+
+      forgetRecentGraph(recentId);
     });
   });
 }
@@ -3345,6 +3645,20 @@ function rememberGraph(document: GraphDocumentV1, sourceName: string, filePath?:
     ...recentGraphs.filter((recent) => recent.id !== id),
   ].slice(0, 8);
   saveRecentGraphs();
+}
+
+function forgetRecentGraph(recentId: string) {
+  recentGraphs = recentGraphs.filter((recent) => recent.id !== recentId);
+  saveRecentGraphs();
+  renderWelcome();
+  hydrateIcons();
+}
+
+function clearRecentGraphs() {
+  recentGraphs = [];
+  saveRecentGraphs();
+  renderWelcome();
+  hydrateIcons();
 }
 
 function loadRecentGraphs(): RecentGraph[] {
