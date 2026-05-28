@@ -411,16 +411,3 @@ Derived data:
   smaller diamonds.
 - If testing becomes impossible, the graph may be too open or the state model may
   need better tooling.
-
-## Open Questions For Our Next Task
-
-- Is DepDoodle a designer-facing editor, an analyzer, or both?
-- Should its native model be puzzle-first, token-first, or hybrid?
-- Do we want strict DAG enforcement or soft warnings?
-- Should act bottlenecks be first-class objects?
-- Should story facts and narrative safety be built in from the start?
-- Should the app include Graphviz/DOT export as an early feature?
-- Should we optimize for adventure games specifically, or keep the model general
-  enough for RPG quests, metroidvania ability gates, crafting chains, and escape
-  rooms?
-
