@@ -19,6 +19,8 @@ import {
   Sun,
   Trash2,
   TriangleAlert,
+  Redo2,
+  Undo2,
   Workflow,
 } from "lucide";
 import { Graphviz } from "@hpcc-js/wasm-graphviz";
@@ -64,6 +66,17 @@ interface GraphDocumentV1 {
   };
   nodes: PuzzleNode[];
   edges: DependencyEdge[];
+}
+
+interface GraphHistorySnapshot {
+  world: {
+    width: number;
+    height: number;
+  };
+  nodes: PuzzleNode[];
+  edges: DependencyEdge[];
+  selectedNodeId: string | null;
+  selectedEdgeId: string | null;
 }
 
 interface LoadedGraph {
@@ -199,6 +212,7 @@ const MAX_EXPORT_PIXELS = 24_000_000;
 const RECENT_GRAPHS_STORAGE_KEY = "depdoodle.recentGraphs";
 const THEME_STORAGE_KEY = "depdoodle.theme";
 const EMPTY_GRAPH_WORLD = { width: 1680, height: 1040 };
+const MAX_HISTORY_DEPTH = 100;
 
 let world = {
   ...EMPTY_GRAPH_WORLD,
@@ -216,6 +230,9 @@ let pendingConnectionFrom: string | null = null;
 let dragState: DragState | null = null;
 let nodeSerial = nodes.length + 1;
 let edgeSerial = edges.length + 1;
+let undoStack: GraphHistorySnapshot[] = [];
+let redoStack: GraphHistorySnapshot[] = [];
+let graphEditBefore: GraphHistorySnapshot | null = null;
 let graphviz: Graphviz | null = null;
 let graphvizLayout: GraphvizLayout | null = null;
 let graphvizError: string | null = null;
@@ -260,6 +277,13 @@ app.innerHTML = `
             <button type="button" role="menuitem" data-export-format="pdf">PDF</button>
           </div>
         </div>
+        <span class="toolbar-separator" aria-hidden="true"></span>
+        <button class="tool-button icon-tool" id="undo-graph" type="button" title="Undo" aria-label="Undo" disabled>
+          <i data-lucide="undo-2"></i>
+        </button>
+        <button class="tool-button icon-tool" id="redo-graph" type="button" title="Redo" aria-label="Redo" disabled>
+          <i data-lucide="redo-2"></i>
+        </button>
         <span class="toolbar-separator" aria-hidden="true"></span>
         <button class="tool-button" id="tool-select" type="button" title="Select and move nodes">
           <i data-lucide="mouse-pointer-2"></i>
@@ -408,6 +432,8 @@ const graphFileInput = must<HTMLInputElement>("#graph-file-input");
 const recentList = must<HTMLDivElement>("#recent-list");
 const exportButton = must<HTMLButtonElement>("#export-graph");
 const exportMenu = must<HTMLDivElement>("#export-menu");
+const undoButton = must<HTMLButtonElement>("#undo-graph");
+const redoButton = must<HTMLButtonElement>("#redo-graph");
 
 resizeWorld(world.width, world.height);
 applyTheme(themeMode);
@@ -430,6 +456,14 @@ must<HTMLButtonElement>("#back-to-welcome").addEventListener("click", () => {
 
 must<HTMLButtonElement>("#save-graph").addEventListener("click", () => {
   void saveGraph();
+});
+
+undoButton.addEventListener("click", () => {
+  undoGraphEdit();
+});
+
+redoButton.addEventListener("click", () => {
+  redoGraphEdit();
 });
 
 exportButton.addEventListener("click", (event) => {
@@ -553,6 +587,22 @@ document.addEventListener("keydown", (event) => {
     setExportMenuOpen(false);
   }
 
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
+    event.preventDefault();
+    if (event.shiftKey) {
+      redoGraphEdit();
+    } else {
+      undoGraphEdit();
+    }
+    return;
+  }
+
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "y") {
+    event.preventDefault();
+    redoGraphEdit();
+    return;
+  }
+
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
     event.preventDefault();
     void saveGraph();
@@ -635,28 +685,151 @@ function setTool(tool: Tool) {
   render();
 }
 
-function addNodeAt(x: number, y: number) {
-  const position = clampNodePosition(x, y);
-  const node: PuzzleNode = {
-    id: `n-custom-${nodeSerial}`,
-    title: `Puzzle ${nodeSerial}`,
-    note: "Describe the player action and the dependency token it creates.",
-    kind: "puzzle",
-    color: defaultNodeColor("puzzle", "Act I"),
-    act: "Act I",
-    x: position.x,
-    y: position.y,
-    width: 210,
-    height: 118,
+function captureGraphHistorySnapshot(): GraphHistorySnapshot {
+  return {
+    world: { ...world },
+    nodes: nodes.map((node) => ({ ...node })),
+    edges: edges.map((edge) => ({ ...edge })),
+    selectedNodeId,
+    selectedEdgeId,
   };
+}
 
-  nodeSerial += 1;
-  nodes = [...nodes, node];
-  selectedNodeId = node.id;
-  selectedEdgeId = null;
+function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
+  nodes = snapshot.nodes.map((node) => ({ ...node }));
+  edges = snapshot.edges.map((edge) => ({ ...edge }));
+  selectedNodeId = snapshot.selectedNodeId;
+  selectedEdgeId = snapshot.selectedEdgeId;
+  pendingConnectionFrom = null;
   activeTool = "select";
   nodeGhostPosition = null;
+  dragState = null;
+  nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
+  edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
+  graphvizLayout = null;
+  graphvizRoutingDirty = true;
+  resizeWorld(snapshot.world.width, snapshot.world.height);
   render();
+}
+
+function graphHistoryDataKey(snapshot: GraphHistorySnapshot) {
+  return JSON.stringify({
+    world: snapshot.world,
+    nodes: snapshot.nodes,
+    edges: snapshot.edges,
+  });
+}
+
+function graphHistoryChanged(before: GraphHistorySnapshot, after: GraphHistorySnapshot) {
+  return graphHistoryDataKey(before) !== graphHistoryDataKey(after);
+}
+
+function beginGraphEdit() {
+  if (!currentGraph || graphEditBefore) {
+    return;
+  }
+
+  graphEditBefore = captureGraphHistorySnapshot();
+}
+
+function commitGraphEdit() {
+  if (!graphEditBefore) {
+    updateHistoryControls();
+    return;
+  }
+
+  const before = graphEditBefore;
+  graphEditBefore = null;
+  const after = captureGraphHistorySnapshot();
+
+  if (graphHistoryChanged(before, after)) {
+    undoStack = [...undoStack, before].slice(-MAX_HISTORY_DEPTH);
+    redoStack = [];
+  }
+
+  updateHistoryControls();
+}
+
+function resetGraphHistory() {
+  undoStack = [];
+  redoStack = [];
+  graphEditBefore = null;
+  updateHistoryControls();
+}
+
+function withGraphEdit(action: () => void) {
+  beginGraphEdit();
+  action();
+  commitGraphEdit();
+}
+
+function undoGraphEdit() {
+  if (!currentGraph) {
+    return;
+  }
+
+  commitGraphEdit();
+  const previous = undoStack.pop();
+
+  if (!previous) {
+    updateHistoryControls();
+    return;
+  }
+
+  redoStack = [...redoStack, captureGraphHistorySnapshot()].slice(-MAX_HISTORY_DEPTH);
+  restoreGraphHistorySnapshot(previous);
+  updateHistoryControls();
+}
+
+function redoGraphEdit() {
+  if (!currentGraph) {
+    return;
+  }
+
+  commitGraphEdit();
+  const next = redoStack.pop();
+
+  if (!next) {
+    updateHistoryControls();
+    return;
+  }
+
+  undoStack = [...undoStack, captureGraphHistorySnapshot()].slice(-MAX_HISTORY_DEPTH);
+  restoreGraphHistorySnapshot(next);
+  updateHistoryControls();
+}
+
+function updateHistoryControls() {
+  undoButton.disabled = !currentGraph || undoStack.length === 0;
+  redoButton.disabled = !currentGraph || redoStack.length === 0;
+  undoButton.title = undoButton.disabled ? "Nothing to undo" : "Undo";
+  redoButton.title = redoButton.disabled ? "Nothing to redo" : "Redo";
+}
+
+function addNodeAt(x: number, y: number) {
+  withGraphEdit(() => {
+    const position = clampNodePosition(x, y);
+    const node: PuzzleNode = {
+      id: `n-custom-${nodeSerial}`,
+      title: `Puzzle ${nodeSerial}`,
+      note: "Describe the player action and the dependency token it creates.",
+      kind: "puzzle",
+      color: defaultNodeColor("puzzle", "Act I"),
+      act: "Act I",
+      x: position.x,
+      y: position.y,
+      width: 210,
+      height: 118,
+    };
+
+    nodeSerial += 1;
+    nodes = [...nodes, node];
+    selectedNodeId = node.id;
+    selectedEdgeId = null;
+    activeTool = "select";
+    nodeGhostPosition = null;
+    render();
+  });
 }
 
 function addDependency(from: string, to: string) {
@@ -666,22 +839,24 @@ function addDependency(from: string, to: string) {
     return;
   }
 
-  const edge: DependencyEdge = {
-    id: `e-custom-${edgeSerial}`,
-    from,
-    to,
-    label: "",
-    tokenType: "state",
-  };
+  withGraphEdit(() => {
+    const edge: DependencyEdge = {
+      id: `e-custom-${edgeSerial}`,
+      from,
+      to,
+      label: "",
+      tokenType: "state",
+    };
 
-  edgeSerial += 1;
-  edges = [...edges, edge];
-  selectedNodeId = null;
-  selectedEdgeId = edge.id;
-  pendingConnectionFrom = null;
-  activeTool = "select";
-  markGraphvizRoutingDirty();
-  render();
+    edgeSerial += 1;
+    edges = [...edges, edge];
+    selectedNodeId = null;
+    selectedEdgeId = edge.id;
+    pendingConnectionFrom = null;
+    activeTool = "select";
+    markGraphvizRoutingDirty();
+    render();
+  });
 }
 
 function createNewGraph() {
@@ -734,6 +909,7 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
   nodeGhostPosition = null;
   graphvizLayout = null;
   graphvizRoutingDirty = true;
+  resetGraphHistory();
   zoom = 1;
 
   const measured = measureGraphBounds(nodes);
@@ -759,6 +935,7 @@ function showWelcomeScreen() {
   pendingConnectionFrom = null;
   activeTool = "select";
   nodeGhostPosition = null;
+  resetGraphHistory();
   setExportMenuOpen(false);
   render();
 }
@@ -1558,8 +1735,11 @@ function isExportFormat(value: unknown): value is ExportFormat {
 }
 
 function autoArrange() {
+  beginGraphEdit();
+
   if (graphviz) {
     applyGraphvizAutoLayout();
+    commitGraphEdit();
     return;
   }
 
@@ -1585,6 +1765,7 @@ function autoArrange() {
   canvasScroll.scrollLeft = 0;
   canvasScroll.scrollTop = 0;
   render();
+  commitGraphEdit();
 }
 
 function applyGraphvizAutoLayout() {
@@ -1624,24 +1805,38 @@ function applyGraphvizAutoLayout() {
 
 function deleteSelection() {
   if (selectedNodeId) {
-    const nodeId = selectedNodeId;
-    const affectsRouting = isRoutedNode(nodeId);
-    nodes = nodes.filter((node) => node.id !== nodeId);
-    edges = edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId);
-    selectedNodeId = null;
-    if (affectsRouting) {
-      markGraphvizRoutingDirty();
-    }
-    render();
+    withGraphEdit(() => {
+      const nodeId = selectedNodeId;
+
+      if (!nodeId) {
+        return;
+      }
+
+      const affectsRouting = isRoutedNode(nodeId);
+      nodes = nodes.filter((node) => node.id !== nodeId);
+      edges = edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId);
+      selectedNodeId = null;
+      if (affectsRouting) {
+        markGraphvizRoutingDirty();
+      }
+      render();
+    });
     return;
   }
 
   if (selectedEdgeId) {
-    const edgeId = selectedEdgeId;
-    edges = edges.filter((edge) => edge.id !== edgeId);
-    selectedEdgeId = null;
-    markGraphvizRoutingDirty();
-    render();
+    withGraphEdit(() => {
+      const edgeId = selectedEdgeId;
+
+      if (!edgeId) {
+        return;
+      }
+
+      edges = edges.filter((edge) => edge.id !== edgeId);
+      selectedEdgeId = null;
+      markGraphvizRoutingDirty();
+      render();
+    });
   }
 }
 
@@ -1713,6 +1908,7 @@ function renderToolbar() {
     button.classList.toggle("active", activeTool === tool);
   }
 
+  updateHistoryControls();
   layoutActionLabel.textContent = "Auto Layout";
   autoLayoutButton.title = "Rearrange nodes by dependency layers";
 }
@@ -2010,32 +2206,45 @@ function renderInspector() {
 }
 
 function bindNodeInspector(nodeId: string) {
-  must<HTMLInputElement>("#node-title").addEventListener("input", (event) => {
+  const titleInput = must<HTMLInputElement>("#node-title");
+  const kindSelect = must<HTMLSelectElement>("#node-kind");
+  const colorInput = must<HTMLInputElement>("#node-color");
+  const difficultyInput = must<HTMLInputElement>("#node-difficulty");
+  const noteInput = must<HTMLTextAreaElement>("#node-note");
+
+  bindGraphEditTransaction(titleInput);
+  bindGraphEditTransaction(colorInput);
+  bindGraphEditTransaction(difficultyInput);
+  bindGraphEditTransaction(noteInput);
+
+  titleInput.addEventListener("input", (event) => {
     updateNode(nodeId, { title: (event.target as HTMLInputElement).value });
     renderNodes();
     renderEdges();
   });
 
-  must<HTMLSelectElement>("#node-kind").addEventListener("change", (event) => {
-    updateNode(nodeId, { kind: (event.target as HTMLSelectElement).value as NodeKind });
-    render();
+  kindSelect.addEventListener("change", (event) => {
+    withGraphEdit(() => {
+      updateNode(nodeId, { kind: (event.target as HTMLSelectElement).value as NodeKind });
+      render();
+    });
   });
 
-  must<HTMLInputElement>("#node-color").addEventListener("input", (event) => {
+  colorInput.addEventListener("input", (event) => {
     const color = sanitizeColor((event.target as HTMLInputElement).value);
     updateNode(nodeId, { color });
     must<HTMLSpanElement>("#node-color-value").textContent = color.toUpperCase();
     renderNodes();
   });
 
-  must<HTMLInputElement>("#node-difficulty").addEventListener("input", (event) => {
+  difficultyInput.addEventListener("input", (event) => {
     const value = (event.target as HTMLInputElement).value.trim();
     const difficulty = value === "" ? undefined : clamp(Number(value), 1, 5);
     updateNode(nodeId, { difficulty });
     renderNodes();
   });
 
-  must<HTMLTextAreaElement>("#node-note").addEventListener("input", (event) => {
+  noteInput.addEventListener("input", (event) => {
     updateNode(nodeId, { note: (event.target as HTMLTextAreaElement).value });
     renderNodes();
   });
@@ -2046,22 +2255,47 @@ function bindNodeInspector(nodeId: string) {
 }
 
 function bindEdgeInspector(edgeId: string) {
-  must<HTMLInputElement>("#edge-label").addEventListener("input", (event) => {
+  const labelInput = must<HTMLInputElement>("#edge-label");
+  const tokenSelect = must<HTMLSelectElement>("#edge-token-type");
+
+  bindGraphEditTransaction(labelInput);
+
+  labelInput.addEventListener("input", (event) => {
     updateEdge(edgeId, { label: (event.target as HTMLInputElement).value });
     markGraphvizRoutingDirty();
     refreshGraphvizRoutingIfNeeded();
     renderEdges();
   });
 
-  must<HTMLSelectElement>("#edge-token-type").addEventListener("change", (event) => {
-    updateEdge(edgeId, {
-      tokenType: (event.target as HTMLSelectElement).value as DependencyEdge["tokenType"],
+  tokenSelect.addEventListener("change", (event) => {
+    withGraphEdit(() => {
+      updateEdge(edgeId, {
+        tokenType: (event.target as HTMLSelectElement).value as DependencyEdge["tokenType"],
+      });
+      render();
     });
-    render();
   });
 
   must<HTMLButtonElement>("#delete-selection").addEventListener("click", () => {
     deleteSelection();
+  });
+}
+
+function bindGraphEditTransaction(element: HTMLElement) {
+  element.addEventListener("focus", () => {
+    beginGraphEdit();
+  });
+
+  element.addEventListener("input", () => {
+    beginGraphEdit();
+  });
+
+  element.addEventListener("change", () => {
+    commitGraphEdit();
+  });
+
+  element.addEventListener("blur", () => {
+    commitGraphEdit();
   });
 }
 
@@ -2090,6 +2324,7 @@ function handleNodePointerDown(event: PointerEvent, nodeId: string) {
   }
 
   const point = getCanvasPoint(event.clientX, event.clientY);
+  beginGraphEdit();
 
   dragState = {
     nodeId,
@@ -2126,6 +2361,7 @@ function finishDrag() {
   dragState = null;
   window.removeEventListener("pointermove", handleDragMove);
   render();
+  commitGraphEdit();
 }
 
 function updateNode(nodeId: string, patch: Partial<PuzzleNode>) {
@@ -3396,11 +3632,13 @@ function hydrateIcons() {
       Moon,
       MousePointer2,
       PanelRight,
+      Redo2,
       Save,
       SquarePlus,
       Sun,
       Trash2,
       TriangleAlert,
+      Undo2,
       Workflow,
       ZoomIn,
       ZoomOut,
