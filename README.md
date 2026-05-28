@@ -243,6 +243,13 @@ Important paths:
 - [PUZZLE_DEPENDENCY_CHART.md](PUZZLE_DEPENDENCY_CHART.md): puzzle dependency
   chart design memo.
 
+## Releases
+
+Release builds are published on GitHub for Windows, macOS, and Linux.
+
+The macOS builds are ad-hoc signed but not notarized. On first launch, macOS may
+block the app until it is allowed from **System Settings > Privacy & Security**.
+
 ## Development
 
 Install dependencies:
