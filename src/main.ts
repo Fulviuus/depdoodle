@@ -37,6 +37,7 @@ type NodeKind = "puzzle" | "gate" | "reward";
 type Tool = "select" | "node" | "connect";
 type ThemeMode = "light" | "dark";
 type ExportFormat = "png" | "jpg" | "pdf" | "svg";
+type CenterTab = "chart" | "pacing";
 
 interface PuzzleNode {
   id: string;
@@ -44,7 +45,6 @@ interface PuzzleNode {
   note: string;
   kind: NodeKind;
   color: string;
-  act: string;
   difficulty?: number;
   x: number;
   y: number;
@@ -92,6 +92,8 @@ interface GraphHistorySnapshot {
   nodes: PuzzleNode[];
   edges: DependencyEdge[];
   groups: PuzzleGroup[];
+  title: string;
+  description: string;
   selectedNodeIds: string[];
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
@@ -208,6 +210,24 @@ interface GraphAnalysis {
   warnings: string[];
   topology: Topology;
   maxLayerWidth: number;
+}
+
+interface PacingLane {
+  id: string;
+  name: string;
+  color: string;
+  nodes: PuzzleNode[];
+}
+
+interface PacingBar {
+  node: PuzzleNode;
+  laneId: string;
+  startLayer: number;
+  endLayer: number;
+  track: number;
+  incoming: number;
+  outgoing: number;
+  role: string;
 }
 
 interface GraphvizNodeLayout {
@@ -340,6 +360,7 @@ let zoom = 1;
 let themeMode: ThemeMode = loadThemeMode();
 let snapToGrid = loadSnapToGrid();
 let exportMenuOpen = false;
+let activeCenterTab: CenterTab = "chart";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -485,18 +506,37 @@ app.innerHTML = `
       </aside>
 
       <main class="canvas-pane">
-        <div class="canvas-ruler horizontal"></div>
-        <div class="canvas-ruler vertical"></div>
-        <div class="canvas-scroll" id="canvas-scroll">
-          <div class="graph-viewport" id="graph-viewport">
-            <div class="graph-space" id="graph-space">
-              <div class="group-layer" id="group-layer"></div>
-              <svg class="edge-layer" id="edge-layer" width="${world.width}" height="${world.height}" viewBox="0 0 ${world.width} ${world.height}">
-              </svg>
-              <div class="node-layer" id="node-layer"></div>
+        <div class="center-tabs" role="tablist" aria-label="Graph views">
+          <button class="center-tab active" id="view-chart" type="button" role="tab" aria-selected="true" aria-controls="chart-panel" title="Show dependency chart">
+            <i data-lucide="workflow"></i>
+            <span>Chart</span>
+          </button>
+          <button class="center-tab" id="view-pacing" type="button" role="tab" aria-selected="false" aria-controls="pacing-panel" title="Show pacing analysis">
+            <i data-lucide="activity"></i>
+            <span>Pacing</span>
+          </button>
+        </div>
+
+        <section class="chart-panel" id="chart-panel" role="tabpanel" aria-labelledby="view-chart">
+          <div class="canvas-ruler horizontal"></div>
+          <div class="canvas-ruler vertical"></div>
+          <div class="canvas-scroll" id="canvas-scroll">
+            <div class="graph-viewport" id="graph-viewport">
+              <div class="graph-space" id="graph-space">
+                <div class="group-layer" id="group-layer"></div>
+                <svg class="edge-layer" id="edge-layer" width="${world.width}" height="${world.height}" viewBox="0 0 ${world.width} ${world.height}">
+                </svg>
+                <div class="node-layer" id="node-layer"></div>
+              </div>
             </div>
           </div>
-        </div>
+        </section>
+
+        <section class="pacing-panel" id="pacing-panel" role="tabpanel" aria-labelledby="view-pacing" hidden>
+          <div class="pacing-scroll" id="pacing-scroll">
+            <div class="pacing-board" id="pacing-board"></div>
+          </div>
+        </section>
       </main>
 
       <aside class="inspector-pane">
@@ -516,6 +556,9 @@ app.innerHTML = `
 const appShell = must<HTMLDivElement>(".app-shell");
 const welcomeScreen = must<HTMLElement>("#welcome-screen");
 const workbench = must<HTMLDivElement>("#workbench");
+const chartPanel = must<HTMLElement>("#chart-panel");
+const pacingPanel = must<HTMLElement>("#pacing-panel");
+const pacingBoard = must<HTMLDivElement>("#pacing-board");
 const graphSpace = must<HTMLDivElement>("#graph-space");
 const graphViewport = must<HTMLDivElement>("#graph-viewport");
 const groupLayer = must<HTMLDivElement>("#group-layer");
@@ -563,6 +606,14 @@ clearRecentButton.addEventListener("click", () => {
 
 must<HTMLButtonElement>("#back-to-welcome").addEventListener("click", () => {
   showWelcomeScreen();
+});
+
+must<HTMLButtonElement>("#view-chart").addEventListener("click", () => {
+  setCenterTab("chart");
+});
+
+must<HTMLButtonElement>("#view-pacing").addEventListener("click", () => {
+  setCenterTab("pacing");
 });
 
 must<HTMLButtonElement>("#save-graph").addEventListener("click", () => {
@@ -803,6 +854,11 @@ function setTool(tool: Tool) {
   render();
 }
 
+function setCenterTab(tab: CenterTab) {
+  activeCenterTab = tab;
+  render();
+}
+
 function isSelectionModifier(event: MouseEvent | PointerEvent) {
   return event.shiftKey || event.metaKey || event.ctrlKey;
 }
@@ -882,6 +938,8 @@ function captureGraphHistorySnapshot(): GraphHistorySnapshot {
     nodes: nodes.map((node) => ({ ...node })),
     edges: edges.map(cloneEdge),
     groups: groups.map(cloneGroup),
+    title: currentGraph?.title ?? "",
+    description: currentGraph?.description ?? "",
     selectedNodeIds: [...selectedNodeIds],
     selectedNodeId,
     selectedEdgeId,
@@ -893,6 +951,13 @@ function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
   nodes = snapshot.nodes.map((node) => ({ ...node }));
   edges = snapshot.edges.map(cloneEdge);
   groups = snapshot.groups.map(cloneGroup);
+  if (currentGraph) {
+    currentGraph = {
+      ...currentGraph,
+      title: snapshot.title,
+      description: snapshot.description.trim() ? snapshot.description : undefined,
+    };
+  }
   selectedNodeIds = new Set(snapshot.selectedNodeIds ?? (snapshot.selectedNodeId ? [snapshot.selectedNodeId] : []));
   selectedNodeId = snapshot.selectedNodeId;
   selectedEdgeId = snapshot.selectedEdgeId;
@@ -931,6 +996,8 @@ function graphHistoryDataKey(snapshot: GraphHistorySnapshot) {
     nodes: snapshot.nodes,
     edges: snapshot.edges,
     groups: snapshot.groups,
+    title: snapshot.title,
+    description: snapshot.description,
   });
 }
 
@@ -1042,8 +1109,7 @@ function addNodeAt(x: number, y: number) {
       title: `Puzzle ${nodeSerial}`,
       note: "Describe the player action and the dependency token it creates.",
       kind: "puzzle",
-      color: defaultNodeColor("puzzle", "Act I"),
-      act: "Act I",
+      color: defaultNodeColor("puzzle"),
       x: position.x,
       y: position.y,
       width: 210,
@@ -1140,6 +1206,7 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
   graphvizRoutingDirty = true;
   resetGraphHistory();
   zoom = 1;
+  activeCenterTab = "chart";
 
   const measured = measureGraphBounds(nodes);
   resizeWorld(
@@ -1166,6 +1233,7 @@ function showWelcomeScreen() {
   renderSelectionBox();
   resetGraphHistory();
   setExportMenuOpen(false);
+  activeCenterTab = "chart";
   render();
 }
 
@@ -1256,11 +1324,13 @@ async function exportGraph(format: ExportFormat) {
 }
 
 function createGraphDocument(): GraphDocumentV1 {
+  const description = currentGraph?.description?.trim();
+
   return {
     format: "depdoodle.graph",
     version: 1,
-    title: currentGraph?.title ?? "Untitled Graph",
-    description: currentGraph?.description,
+    title: currentGraph?.title.trim() || "Untitled Graph",
+    ...(description ? { description } : {}),
     world: { ...world },
     nodes: nodes.map((node) => ({ ...node })),
     edges: edges.map(cloneEdge),
@@ -2981,6 +3051,7 @@ function render() {
   refreshGraphvizRoutingIfNeeded();
   const analysis = analyzeGraph();
 
+  renderCenterTabs();
   renderToolbar();
   renderGroups();
   renderEdges();
@@ -2989,6 +3060,7 @@ function render() {
   renderMetrics(analysis);
   renderWidthBars(analysis);
   renderWarnings(analysis);
+  renderPacingView(analysis);
   renderInspector();
   ensureButtonTooltips();
   hydrateIcons();
@@ -2999,6 +3071,22 @@ function renderAppMode() {
   appShell.classList.toggle("is-welcome", isWelcome);
   welcomeScreen.hidden = !isWelcome;
   workbench.hidden = isWelcome;
+}
+
+function renderCenterTabs() {
+  const chartButton = must<HTMLButtonElement>("#view-chart");
+  const pacingButton = must<HTMLButtonElement>("#view-pacing");
+  const isChart = activeCenterTab === "chart";
+
+  chartPanel.hidden = !isChart;
+  pacingPanel.hidden = isChart;
+
+  chartButton.classList.toggle("active", isChart);
+  pacingButton.classList.toggle("active", !isChart);
+  chartButton.setAttribute("aria-selected", String(isChart));
+  pacingButton.setAttribute("aria-selected", String(!isChart));
+  chartButton.tabIndex = isChart ? 0 : -1;
+  pacingButton.tabIndex = isChart ? -1 : 0;
 }
 
 function renderWelcome() {
@@ -3350,6 +3438,346 @@ function renderWarnings(analysis: GraphAnalysis) {
     .join("");
 }
 
+function renderPacingView(analysis: GraphAnalysis) {
+  if (nodes.length === 0) {
+    pacingBoard.innerHTML = `
+      <div class="pacing-empty">
+        <h2>Pacing</h2>
+        <p>Add puzzle nodes and dependencies to see the adventure pacing map.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const layerCount = Math.max(1, analysis.topology.layers.length);
+  const lanes = buildPacingLanes(analysis);
+  const bars = buildPacingBars(analysis, lanes, layerCount);
+  const barsByLane = new Map(lanes.map((lane) => [lane.id, bars.filter((bar) => bar.laneId === lane.id)]));
+  const layerWidths = Array.from({ length: layerCount }, (_, index) => analysis.topology.layers[index]?.length ?? 0);
+  const widestLayerWidth = Math.max(...layerWidths);
+  const widestLayer = layerWidths.indexOf(widestLayerWidth);
+  const criticalPath = criticalPathForAnalysis(analysis);
+  const nonRewardLeaves = analysis.leaves.filter((node) => node.kind !== "reward");
+  const rewardLeaves = analysis.leaves.filter((node) => node.kind === "reward");
+  const notes = pacingNotes(analysis, widestLayer + 1, criticalPath, nonRewardLeaves);
+
+  pacingBoard.style.setProperty("--layer-count", `${layerCount}`);
+  pacingBoard.innerHTML = `
+    <section class="pacing-summary" aria-label="Pacing summary">
+      <div class="pacing-stat">
+        <span>Widest Layer</span>
+        <strong>${widestLayerWidth}</strong>
+        <small>L${widestLayer + 1} ${escapeHtml(layerPressureLabel(widestLayerWidth))}</small>
+      </div>
+      <div class="pacing-stat">
+        <span>Closers</span>
+        <strong>${analysis.bottlenecks.length}</strong>
+        <small>${analysis.bottlenecks.length === 1 ? "resync point" : "resync points"}</small>
+      </div>
+      <div class="pacing-stat">
+        <span>Critical Path</span>
+        <strong>${criticalPath.length}</strong>
+        <small>${escapeHtml(criticalPathLabel(criticalPath))}</small>
+      </div>
+      <div class="pacing-stat">
+        <span>Loose Leaves</span>
+        <strong>${nonRewardLeaves.length}</strong>
+        <small>${rewardLeaves.length} reward ${rewardLeaves.length === 1 ? "leaf" : "leaves"}</small>
+      </div>
+    </section>
+
+    <section class="pacing-notes" aria-label="Adventure pacing signals">
+      <h2>Adventure Signals</h2>
+      <div class="pacing-note-list">
+        ${notes.map((note) => `<p>${escapeHtml(note)}</p>`).join("")}
+      </div>
+    </section>
+
+    <section class="pacing-timeline" aria-label="Puzzle availability by dependency layer">
+      <div class="pacing-header-row">
+        <div class="pacing-lane-heading">Thread</div>
+        ${layerWidths
+          .map(
+            (width, index) => `
+              <div class="pacing-layer-heading">
+                <strong>L${index + 1}</strong>
+                <span>${width} ${width === 1 ? "node" : "nodes"}</span>
+              </div>
+            `,
+          )
+          .join("")}
+      </div>
+      ${lanes
+        .map((lane) => renderPacingLane(lane, barsByLane.get(lane.id) ?? [], layerCount))
+        .join("")}
+    </section>
+  `;
+
+  pacingBoard.querySelectorAll<HTMLButtonElement>(".pacing-bar").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nodeId = button.dataset.nodeId;
+
+      if (!nodeId) {
+        return;
+      }
+
+      selectOnlyNode(nodeId);
+      render();
+    });
+  });
+}
+
+function renderPacingLane(lane: PacingLane, bars: PacingBar[], layerCount: number) {
+  const trackCount = Math.max(1, ...bars.map((bar) => bar.track + 1));
+  const nodeCount = bars.length;
+
+  return `
+    <div class="pacing-lane" style="--lane-tracks: ${trackCount}; --lane-color: ${escapeAttribute(lane.color)};">
+      <div class="pacing-lane-label">
+        <span class="pacing-lane-color" aria-hidden="true"></span>
+        <strong title="${escapeAttribute(lane.name)}">${escapeHtml(lane.name)}</strong>
+        <small>${nodeCount} ${nodeCount === 1 ? "node" : "nodes"}</small>
+      </div>
+      ${Array.from({ length: layerCount }, (_, index) => `<div class="pacing-cell" style="grid-column: ${index + 2}; grid-row: 1 / span ${trackCount};"></div>`).join("")}
+      ${bars.map((bar) => renderPacingBar(bar)).join("")}
+    </div>
+  `;
+}
+
+function renderPacingBar(bar: PacingBar) {
+  const selected = selectedNodeIds.has(bar.node.id) ? " selected" : "";
+  const title = `${bar.node.title}: ${bar.role}. Layers ${bar.startLayer + 1}-${bar.endLayer + 1}. ${bar.incoming} in, ${bar.outgoing} out. Safe facts: ${getAncestors(bar.node.id).length}.`;
+  const difficulty = typeof bar.node.difficulty === "number" ? ` · D${bar.node.difficulty}` : "";
+
+  return `
+    <button
+      class="pacing-bar node-${bar.node.kind}${selected}"
+      type="button"
+      data-node-id="${escapeAttribute(bar.node.id)}"
+      title="${escapeAttribute(title)}"
+      style="grid-column: ${bar.startLayer + 2} / ${bar.endLayer + 3}; grid-row: ${bar.track + 1}; --node-color: ${escapeAttribute(nodeColor(bar.node))};"
+    >
+      <span class="pacing-bar-title">${escapeHtml(bar.node.title)}</span>
+      <span class="pacing-bar-meta">${escapeHtml(bar.role)} · ${bar.incoming} in · ${bar.outgoing} out${difficulty}</span>
+    </button>
+  `;
+}
+
+function buildPacingLanes(analysis: GraphAnalysis): PacingLane[] {
+  const assignedNodeIds = new Set<string>();
+  const lanes: PacingLane[] = [];
+
+  groups.forEach((group) => {
+    const laneNodes = group.nodeIds
+      .map((nodeId) => getNode(nodeId))
+      .filter((node): node is PuzzleNode => node !== undefined && !assignedNodeIds.has(node.id));
+
+    if (laneNodes.length === 0) {
+      return;
+    }
+
+    laneNodes.forEach((node) => assignedNodeIds.add(node.id));
+    lanes.push({
+      id: `group:${group.id}`,
+      name: group.name.trim() || "Untitled group",
+      color: groupColor(group),
+      nodes: laneNodes,
+    });
+  });
+
+  const ungroupedNodes = nodes.filter((node) => !assignedNodeIds.has(node.id));
+
+  if (ungroupedNodes.length > 0) {
+    lanes.push({
+      id: "ungrouped",
+      name: "Ungrouped",
+      color: defaultGroupColor(lanes.length + 1),
+      nodes: ungroupedNodes,
+    });
+  }
+
+  return lanes.sort((a, b) => laneStartLayer(a, analysis) - laneStartLayer(b, analysis) || a.name.localeCompare(b.name));
+}
+
+function buildPacingBars(analysis: GraphAnalysis, lanes: PacingLane[], layerCount: number): PacingBar[] {
+  const bars: PacingBar[] = [];
+
+  for (const lane of lanes) {
+    const laneBars = lane.nodes
+      .map((node) => {
+        const startLayer = analysis.topology.layerByNode.get(node.id) ?? 0;
+        const childLayers = outgoingEdges(node.id)
+          .map((edge) => analysis.topology.layerByNode.get(edge.to))
+          .filter((layer): layer is number => typeof layer === "number");
+        const endLayer =
+          childLayers.length > 0
+            ? Math.max(startLayer, ...childLayers)
+            : Math.max(startLayer, layerCount - 1);
+
+        return {
+          node,
+          laneId: lane.id,
+          startLayer,
+          endLayer,
+          track: 0,
+          incoming: incomingEdges(node.id).length,
+          outgoing: outgoingEdges(node.id).length,
+          role: designRoleForNode(node, analysis),
+        };
+      })
+      .sort((a, b) => a.startLayer - b.startLayer || a.endLayer - b.endLayer || compareNodesByPosition(a.node, b.node));
+
+    const trackEnds: number[] = [];
+
+    for (const bar of laneBars) {
+      const track = trackEnds.findIndex((endLayer) => endLayer < bar.startLayer);
+      const assignedTrack = track === -1 ? trackEnds.length : track;
+      bar.track = assignedTrack;
+      trackEnds[assignedTrack] = bar.endLayer;
+      bars.push(bar);
+    }
+  }
+
+  return bars;
+}
+
+function laneStartLayer(lane: PacingLane, analysis: GraphAnalysis) {
+  return Math.min(...lane.nodes.map((node) => analysis.topology.layerByNode.get(node.id) ?? 0));
+}
+
+function designRoleForNode(node: PuzzleNode, analysis: GraphAnalysis) {
+  const incoming = incomingEdges(node.id).length;
+  const outgoing = outgoingEdges(node.id).length;
+  const isRoot = analysis.roots.some((root) => root.id === node.id);
+  const isLeaf = analysis.leaves.some((leaf) => leaf.id === node.id);
+
+  if (isLeaf && node.kind === "reward") {
+    return "Reward";
+  }
+
+  if (isLeaf) {
+    return "Loose leaf";
+  }
+
+  if (incoming >= 2 && outgoing >= 2) {
+    return "Hinge";
+  }
+
+  if (incoming >= 2) {
+    return "Closer";
+  }
+
+  if (isRoot || outgoing >= 2) {
+    return "Opener";
+  }
+
+  return incoming === 1 && outgoing === 1 ? "Chain" : labelForKind(node.kind);
+}
+
+function criticalPathForAnalysis(analysis: GraphAnalysis) {
+  if (nodes.length === 0) {
+    return [];
+  }
+
+  const bestByNode = new Map<string, { length: number; parentId: string | null }>();
+
+  for (const node of analysis.topology.order) {
+    const bestParent = incomingEdges(node.id)
+      .map((edge) => ({
+        nodeId: edge.from,
+        length: bestByNode.get(edge.from)?.length ?? 0,
+      }))
+      .sort((a, b) => b.length - a.length)[0];
+
+    bestByNode.set(node.id, {
+      length: (bestParent?.length ?? 0) + 1,
+      parentId: bestParent?.nodeId ?? null,
+    });
+  }
+
+  const endNodeId = [...bestByNode.entries()].sort((a, b) => b[1].length - a[1].length)[0]?.[0];
+
+  if (!endNodeId) {
+    return [];
+  }
+
+  const path: PuzzleNode[] = [];
+  let cursor: string | null = endNodeId;
+
+  while (cursor) {
+    const node = getNode(cursor);
+
+    if (node) {
+      path.unshift(node);
+    }
+
+    cursor = bestByNode.get(cursor)?.parentId ?? null;
+  }
+
+  return path;
+}
+
+function pacingNotes(
+  analysis: GraphAnalysis,
+  widestLayer: number,
+  criticalPath: PuzzleNode[],
+  nonRewardLeaves: PuzzleNode[],
+) {
+  const notes: string[] = [];
+
+  if (analysis.maxLayerWidth <= 1 && nodes.length > 2) {
+    notes.push("Mostly linear structure: one stuck puzzle can stop the player cold unless the intent is a tight sequence.");
+  } else if (analysis.maxLayerWidth > 5) {
+    notes.push(`Layer ${widestLayer} is broad: freedom is high, but dialogue, hints, state tracking, and QA combinations get expensive.`);
+  } else {
+    notes.push("Layer width is in a manageable range for parallel adventure-game work.");
+  }
+
+  if (analysis.bottlenecks.length > 0) {
+    notes.push("Closers are narrative resync points: they are good places to retire inventory, move acts, or safely reference prior events.");
+  } else if (nodes.length > 3) {
+    notes.push("No closers yet: the chart may need a milestone where parallel threads intentionally collapse.");
+  }
+
+  if (criticalPath.length > 4) {
+    notes.push(`Longest chain has ${criticalPath.length} steps: check whether that stretch offers enough side work while players are stuck.`);
+  }
+
+  if (nonRewardLeaves.length > 0) {
+    notes.push("Loose leaves should usually become rewards, optional content, or feed another puzzle.");
+  }
+
+  return notes;
+}
+
+function layerPressureLabel(width: number) {
+  if (width <= 1) {
+    return "linear";
+  }
+
+  if (width <= 3) {
+    return "focused";
+  }
+
+  if (width <= 5) {
+    return "broad";
+  }
+
+  return "heavy";
+}
+
+function criticalPathLabel(path: PuzzleNode[]) {
+  if (path.length === 0) {
+    return "none";
+  }
+
+  if (path.length === 1) {
+    return path[0].title;
+  }
+
+  return `${path[0].title} -> ${path[path.length - 1].title}`;
+}
+
 function renderInspector() {
   const selectedNodes = nodes.filter((node) => selectedNodeIds.has(node.id));
   const selectedNode = selectedNodes.length === 1 ? selectedNodes[0] : null;
@@ -3538,12 +3966,53 @@ function renderInspector() {
     return;
   }
 
+  const chartTitle = currentGraph?.title ?? "Untitled Graph";
+  const chartDescription = currentGraph?.description ?? "";
+  const sourceName = currentGraph?.sourceName ?? "Unsaved graph";
+
   inspector.innerHTML = `
-    <div class="inspector-empty">
-      <i data-lucide="mouse-pointer-2"></i>
-      <p>Select a puzzle node or dependency arrow to edit its chart semantics.</p>
+    <div class="chart-inspector">
+      <div class="field-group">
+        <label for="chart-title">Chart Name</label>
+        <input id="chart-title" value="${escapeAttribute(chartTitle)}" />
+      </div>
+      <div class="field-group">
+        <label for="chart-description">Description</label>
+        <textarea id="chart-description" placeholder="Project notes, scope, source, or design memo.">${escapeHtml(chartDescription)}</textarea>
+      </div>
+      <div class="relationship-list">
+        <h3>File</h3>
+        <p>${escapeHtml(sourceName)}</p>
+        <h3>Contents</h3>
+        <p>${nodes.length} nodes, ${edges.length} dependencies, ${groups.length} groups</p>
+      </div>
+      <div class="inspector-empty compact">
+        <i data-lucide="mouse-pointer-2"></i>
+        <p>Select a puzzle node, group, or dependency arrow to edit chart objects.</p>
+      </div>
     </div>
   `;
+
+  bindChartInspector();
+}
+
+function bindChartInspector() {
+  const titleInput = must<HTMLInputElement>("#chart-title");
+  const descriptionInput = must<HTMLTextAreaElement>("#chart-description");
+
+  bindGraphEditTransaction(titleInput);
+  bindGraphEditTransaction(descriptionInput);
+
+  titleInput.addEventListener("input", (event) => {
+    const value = (event.target as HTMLInputElement).value;
+    updateChartMetadata({ title: value });
+    renderWelcome();
+  });
+
+  descriptionInput.addEventListener("input", (event) => {
+    const value = (event.target as HTMLTextAreaElement).value;
+    updateChartMetadata({ description: value });
+  });
 }
 
 function bindNodeInspector(nodeId: string) {
@@ -4122,6 +4591,20 @@ function updateEdge(edgeId: string, patch: Partial<DependencyEdge>) {
 
 function updateGroup(groupId: string, patch: Partial<PuzzleGroup>) {
   groups = groups.map((group) => (group.id === groupId ? { ...group, ...patch } : group));
+}
+
+function updateChartMetadata(patch: { title?: string; description?: string }) {
+  if (!currentGraph) {
+    return;
+  }
+
+  currentGraph = {
+    ...currentGraph,
+    ...(typeof patch.title === "string" ? { title: patch.title } : {}),
+    ...(typeof patch.description === "string"
+      ? { description: patch.description.trim() ? patch.description : undefined }
+      : {}),
+  };
 }
 
 function clearEdgeRouteOverride(edgeId: string) {
@@ -5155,15 +5638,17 @@ function normalizeGraphDocument(value: unknown): GraphDocumentV1 {
   }
 
   const normalizedNodes = record.nodes.map((node) => normalizeGraphNode(node));
+  const legacyActByNodeId = legacyActMap(record.nodes, normalizedNodes);
   const nodeIds = new Set(normalizedNodes.map((node) => node.id));
   const normalizedEdges = record.edges
     .map((edge) => normalizeGraphEdge(edge))
     .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
-  const normalizedGroups = Array.isArray(record.groups)
+  const explicitGroups = Array.isArray(record.groups)
     ? record.groups
         .map((group) => normalizeGraphGroup(group, nodeIds))
         .filter((group) => group.nodeIds.length > 0)
     : [];
+  const normalizedGroups = groupsWithLegacyActs(explicitGroups, normalizedNodes, legacyActByNodeId, normalizedEdges);
   const worldRecord = isRecord(record.world) ? record.world : {};
 
   return {
@@ -5190,7 +5675,6 @@ function normalizeGraphNode(value: unknown): PuzzleNode {
   }
 
   const kind = isNodeKind(record.kind) ? record.kind : "puzzle";
-  const act = stringValue(record.act, "Act I");
   const difficulty = optionalDifficulty(record.difficulty);
 
   return {
@@ -5198,8 +5682,7 @@ function normalizeGraphNode(value: unknown): PuzzleNode {
     title: stringValue(record.title, "Untitled puzzle"),
     note: stringValue(record.note, ""),
     kind,
-    color: sanitizeColor(stringValue(record.color, defaultNodeColor(kind, act))),
-    act,
+    color: sanitizeColor(stringValue(record.color, defaultNodeColor(kind))),
     difficulty,
     x: finiteNumber(record.x, 80),
     y: finiteNumber(record.y, 80),
@@ -5258,6 +5741,206 @@ function normalizeGraphGroup(value: unknown, knownNodeIds: Set<string>): PuzzleG
     nodeIds,
     hidden: record.hidden === true,
   };
+}
+
+function legacyActMap(rawNodes: unknown[], normalizedNodes: PuzzleNode[]) {
+  const actByNodeId = new Map<string, string>();
+
+  rawNodes.forEach((rawNode, index) => {
+    if (!isRecord(rawNode)) {
+      return;
+    }
+
+    const act = optionalString(rawNode.act)?.trim();
+    const node = normalizedNodes[index];
+
+    if (act && node) {
+      actByNodeId.set(node.id, act);
+    }
+  });
+
+  return actByNodeId;
+}
+
+function groupsWithLegacyActs(
+  explicitGroups: PuzzleGroup[],
+  graphNodes: PuzzleNode[],
+  legacyActByNodeId: Map<string, string>,
+  graphEdges: DependencyEdge[],
+) {
+  const visibleGroups = splitBeginningEndingGroups(explicitGroups, graphNodes, graphEdges);
+
+  if (legacyActByNodeId.size === 0) {
+    return visibleGroups;
+  }
+
+  const groupsByName = new Map(visibleGroups.map((group) => [group.name.trim().toLowerCase(), group]));
+  const assignedNodeIds = new Set(visibleGroups.flatMap((group) => group.nodeIds));
+  const nextGroups = visibleGroups.map(cloneGroup);
+  const nextGroupsByName = new Map(nextGroups.map((group) => [group.name.trim().toLowerCase(), group]));
+  const usedGroupIds = new Set(nextGroups.map((group) => group.id));
+
+  graphNodes.forEach((node) => {
+    const rawAct = legacyActByNodeId.get(node.id);
+    const act = rawAct ? visibleGroupNameForLegacyAct(rawAct, node, graphEdges) : undefined;
+
+    if (!act) {
+      return;
+    }
+
+    const key = act.toLowerCase();
+    const matchingExplicitGroup = groupsByName.get(key);
+
+    if (!matchingExplicitGroup && assignedNodeIds.has(node.id)) {
+      return;
+    }
+
+    let group = nextGroupsByName.get(key);
+
+    if (!group) {
+      group = {
+        id: uniqueGroupId(`g-${slugify(act) || "legacy-act"}`, usedGroupIds),
+        name: act,
+        color: legacyActGroupColor(act, graphNodes, legacyActByNodeId, graphEdges),
+        nodeIds: [],
+        hidden: false,
+      };
+      nextGroups.push(group);
+      nextGroupsByName.set(key, group);
+      usedGroupIds.add(group.id);
+    }
+
+    if (!group.nodeIds.includes(node.id)) {
+      group.nodeIds.push(node.id);
+    }
+  });
+
+  return nextGroups.filter((group) => group.nodeIds.length > 0);
+}
+
+function splitBeginningEndingGroups(
+  graphGroups: PuzzleGroup[],
+  graphNodes: PuzzleNode[],
+  graphEdges: DependencyEdge[],
+) {
+  const splitGroups: PuzzleGroup[] = [];
+  const usedGroupIds = new Set(graphGroups.map((group) => group.id));
+
+  graphGroups.forEach((group) => {
+    if (!isBeginningEndingName(group.name)) {
+      splitGroups.push(cloneGroup(group));
+      return;
+    }
+
+    const beginningNodeIds: string[] = [];
+    const endingNodeIds: string[] = [];
+
+    group.nodeIds.forEach((nodeId) => {
+      const node = graphNodes.find((candidate) => candidate.id === nodeId);
+
+      if (!node) {
+        return;
+      }
+
+      if (beginningEndingGroupNameForNode(node, graphEdges) === "Beginning") {
+        beginningNodeIds.push(nodeId);
+      } else {
+        endingNodeIds.push(nodeId);
+      }
+    });
+
+    if (beginningNodeIds.length > 0) {
+      splitGroups.push({
+        ...group,
+        id: uniqueGroupId("g-beginning", usedGroupIds),
+        name: "Beginning",
+        color: "#d72a15",
+        nodeIds: beginningNodeIds,
+      });
+      usedGroupIds.add(splitGroups[splitGroups.length - 1].id);
+    }
+
+    if (endingNodeIds.length > 0) {
+      splitGroups.push({
+        ...group,
+        id: uniqueGroupId("g-ending", usedGroupIds),
+        name: "Ending",
+        color: "#7f6699",
+        nodeIds: endingNodeIds,
+      });
+      usedGroupIds.add(splitGroups[splitGroups.length - 1].id);
+    }
+  });
+
+  return splitGroups;
+}
+
+function visibleGroupNameForLegacyAct(act: string, node: PuzzleNode, graphEdges: DependencyEdge[]) {
+  return isBeginningEndingName(act) ? beginningEndingGroupNameForNode(node, graphEdges) : act;
+}
+
+function isBeginningEndingName(name: string) {
+  return name.trim().toLowerCase() === "beginning / ending";
+}
+
+function beginningEndingGroupNameForNode(node: PuzzleNode, graphEdges: DependencyEdge[]) {
+  const normalizedTitle = node.title.trim().toLowerCase();
+  const incoming = graphEdges.filter((edge) => edge.to === node.id).length;
+
+  return incoming === 0 || /\b(begin|start|opening|intro)\b/.test(normalizedTitle) ? "Beginning" : "Ending";
+}
+
+function legacyActGroupColor(
+  act: string,
+  graphNodes: PuzzleNode[],
+  legacyActByNodeId: Map<string, string>,
+  graphEdges: DependencyEdge[],
+) {
+  const fallbackColors: Record<string, string> = {
+    beginning: "#d72a15",
+    "beginning / ending": "#d72a15",
+    bernard: "#6395dc",
+    ending: "#7f6699",
+    hoagie: "#f19c49",
+    laverne: "#008d00",
+  };
+  const semanticColor = fallbackColors[act.toLowerCase()];
+
+  if (semanticColor) {
+    return semanticColor;
+  }
+
+  const firstNodeColor = graphNodes.find((node) => {
+    const rawAct = legacyActByNodeId.get(node.id);
+
+    return rawAct ? visibleGroupNameForLegacyAct(rawAct, node, graphEdges) === act : false;
+  })?.color;
+
+  if (firstNodeColor) {
+    return firstNodeColor;
+  }
+
+  return defaultGroupColor(1);
+}
+
+function uniqueGroupId(baseId: string, usedGroupIds: Set<string>) {
+  let candidate = baseId;
+  let suffix = 2;
+
+  while (usedGroupIds.has(candidate)) {
+    candidate = `${baseId}-${suffix}`;
+    suffix += 1;
+  }
+
+  return candidate;
+}
+
+function slugify(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
 }
 
 function rememberGraph(document: GraphDocumentV1, sourceName: string, filePath?: string) {
@@ -5532,23 +6215,7 @@ function isTokenType(value: unknown): value is DependencyEdge["tokenType"] {
   return value === "item" || value === "access" || value === "fact" || value === "state" || value === "permission";
 }
 
-function defaultNodeColor(kind: NodeKind, act = "") {
-  if (act === "Laverne") {
-    return "#008d00";
-  }
-
-  if (act === "Bernard") {
-    return "#6395dc";
-  }
-
-  if (act === "Hoagie") {
-    return "#f19c49";
-  }
-
-  if (act === "Beginning / Ending") {
-    return "#d72a15";
-  }
-
+function defaultNodeColor(kind: NodeKind) {
   const colors: Record<NodeKind, string> = {
     puzzle: "#549aa3",
     gate: "#c18b2c",
@@ -5565,7 +6232,7 @@ function defaultGroupColor(serial = 1) {
 }
 
 function nodeColor(node: PuzzleNode) {
-  return sanitizeColor(node.color || defaultNodeColor(node.kind, node.act));
+  return sanitizeColor(node.color || defaultNodeColor(node.kind));
 }
 
 function groupColor(group: PuzzleGroup) {
