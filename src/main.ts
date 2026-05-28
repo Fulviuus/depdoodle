@@ -25,7 +25,7 @@ import {
 } from "lucide";
 import { Graphviz } from "@hpcc-js/wasm-graphviz";
 import { isTauri } from "@tauri-apps/api/core";
-import { save as showSaveDialog } from "@tauri-apps/plugin-dialog";
+import { ask, save as showSaveDialog } from "@tauri-apps/plugin-dialog";
 import { writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
 
 type NodeKind = "puzzle" | "gate" | "reward";
@@ -200,7 +200,7 @@ interface GraphvizJson {
 declare global {
   interface Window {
     __depdoodleDebug?: {
-      autoLayout: () => void;
+      autoLayout: () => Promise<void>;
       labelAttachmentReport: () => ReturnType<typeof edgeLabelAttachmentReport>;
       loadGraph: (document: GraphDocumentV1) => void;
       waitForGraphviz: () => Promise<void>;
@@ -225,6 +225,7 @@ const EXPORT_PADDING = 56;
 const EXPORT_RASTER_SCALE = 2;
 const MAX_EXPORT_PIXELS = 96_000_000;
 const EXPORT_FONT_FAMILY = 'Roboto, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+const AUTO_LAYOUT_CONFIRM_MESSAGE = "Auto Layout will rearrange every node in this graph. You can undo it afterward. Continue?";
 const RECENT_GRAPHS_STORAGE_KEY = "depdoodle.recentGraphs";
 const THEME_STORAGE_KEY = "depdoodle.theme";
 const EMPTY_GRAPH_WORLD = { width: 1680, height: 1040 };
@@ -531,7 +532,7 @@ must<HTMLButtonElement>("#tool-connect").addEventListener("click", () => {
 });
 
 autoLayoutButton.addEventListener("click", () => {
-  autoArrange();
+  void autoArrange();
 });
 
 zoomOutButton.addEventListener("click", () => {
@@ -685,7 +686,7 @@ document.addEventListener("keydown", (event) => {
   }
 
   if (event.key.toLowerCase() === "l") {
-    autoArrange();
+    void autoArrange();
   }
 });
 
@@ -2015,12 +2016,21 @@ function isExportFormat(value: unknown): value is ExportFormat {
   return value === "png" || value === "jpg" || value === "pdf" || value === "svg";
 }
 
-function confirmAutoLayout() {
-  return window.confirm("Auto Layout will rearrange every node in this graph. You can undo it afterward. Continue?");
+async function confirmAutoLayout() {
+  if (isTauriRuntime()) {
+    return ask(AUTO_LAYOUT_CONFIRM_MESSAGE, {
+      title: "Auto Layout",
+      kind: "warning",
+      okLabel: "Auto Layout",
+      cancelLabel: "Cancel",
+    });
+  }
+
+  return window.confirm(AUTO_LAYOUT_CONFIRM_MESSAGE);
 }
 
-function autoArrange(options: { confirm?: boolean } = {}) {
-  if (options.confirm !== false && !confirmAutoLayout()) {
+async function autoArrange(options: { confirm?: boolean } = {}) {
+  if (options.confirm !== false && !(await confirmAutoLayout())) {
     return;
   }
 
@@ -3980,8 +3990,8 @@ function installDebugApi() {
   }
 
   window.__depdoodleDebug = {
-    autoLayout: () => {
-      autoArrange({ confirm: false });
+    autoLayout: async () => {
+      await autoArrange({ confirm: false });
     },
     labelAttachmentReport: edgeLabelAttachmentReport,
     loadGraph: (document) => {
