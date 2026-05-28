@@ -766,8 +766,8 @@ button {
   fill: none;
   stroke: var(--edge-color);
   stroke-width: 2.2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+  stroke-linecap: butt;
+  stroke-linejoin: miter;
 }
 
 .edge-group.selected .edge-path {

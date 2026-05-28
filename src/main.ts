@@ -2388,7 +2388,7 @@ function parseGraphvizJson(json: GraphvizJson): GraphvizLayout {
     }
 
     parsedEdges.set(geometry.edgeId, {
-      path: bezierPath(geometry.pathPoints),
+      path: orthogonalPath(geometry.pathPoints),
       arrowPoints: geometry.arrowPoints,
       labelX: labelPoint.x,
       labelY: labelPoint.y,
@@ -2809,20 +2809,20 @@ function nearestPointDistance(point: Point, candidates: Point[]) {
   return Math.min(...candidates.map((candidate) => distanceBetween(point, candidate)));
 }
 
-function bezierPath(points: Point[]) {
+function orthogonalPath(points: Point[]) {
   if (points.length === 0) {
     return "";
   }
 
-  const commands = [`M ${round(points[0].x)} ${round(points[0].y)}`];
+  const routePoints = points.filter((point, index) => {
+    const previous = points[index - 1];
 
-  for (let index = 1; index + 2 < points.length; index += 3) {
-    const a = points[index];
-    const b = points[index + 1];
-    const c = points[index + 2];
-    commands.push(
-      `C ${round(a.x)} ${round(a.y)} ${round(b.x)} ${round(b.y)} ${round(c.x)} ${round(c.y)}`,
-    );
+    return !previous || distanceBetween(previous, point) > 0.1;
+  });
+  const commands = [`M ${round(routePoints[0].x)} ${round(routePoints[0].y)}`];
+
+  for (const point of routePoints.slice(1)) {
+    commands.push(`L ${round(point.x)} ${round(point.y)}`);
   }
 
   return commands.join(" ");
