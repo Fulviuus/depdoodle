@@ -8,6 +8,7 @@ import {
   History,
   House,
   Layers3,
+  Magnet,
   Maximize2,
   Moon,
   MousePointer2,
@@ -53,6 +54,8 @@ interface DependencyEdge {
   to: string;
   label: string;
   tokenType: "item" | "access" | "fact" | "state" | "permission";
+  manualRoute?: Point[];
+  manualLabelPosition?: number;
 }
 
 interface GraphDocumentV1 {
@@ -125,6 +128,22 @@ interface DragState {
   nodeId: string;
   offsetX: number;
   offsetY: number;
+}
+
+type EdgeSegmentOrientation = "horizontal" | "vertical" | "free";
+
+interface EdgeRouteDragState {
+  edgeId: string;
+  segmentIndex: number;
+  orientation: EdgeSegmentOrientation;
+  startPoint: Point;
+  originalPoints: Point[];
+}
+
+interface EdgeLabelDragState {
+  edgeId: string;
+  originalPosition: number;
+  startPointerPosition: number;
 }
 
 interface Topology {
@@ -221,6 +240,7 @@ const MIN_AUTO_RANKSEP = 3.6;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 2.5;
 const ZOOM_STEP = 1.2;
+const SNAP_GRID_SIZE = 24;
 const EXPORT_PADDING = 56;
 const EXPORT_RASTER_SCALE = 2;
 const MAX_EXPORT_PIXELS = 96_000_000;
@@ -228,6 +248,7 @@ const EXPORT_FONT_FAMILY = 'Roboto, Inter, ui-sans-serif, system-ui, -apple-syst
 const AUTO_LAYOUT_CONFIRM_MESSAGE = "Auto Layout will rearrange every node in this graph. You can undo it afterward. Continue?";
 const RECENT_GRAPHS_STORAGE_KEY = "depdoodle.recentGraphs";
 const THEME_STORAGE_KEY = "depdoodle.theme";
+const SNAP_TO_GRID_STORAGE_KEY = "depdoodle.snapToGrid";
 const EMPTY_GRAPH_WORLD = { width: 1680, height: 1040 };
 const MAX_HISTORY_DEPTH = 100;
 
@@ -245,6 +266,8 @@ let selectedEdgeId: string | null = null;
 let activeTool: Tool = "select";
 let pendingConnectionFrom: string | null = null;
 let dragState: DragState | null = null;
+let edgeRouteDragState: EdgeRouteDragState | null = null;
+let edgeLabelDragState: EdgeLabelDragState | null = null;
 let nodeSerial = nodes.length + 1;
 let edgeSerial = edges.length + 1;
 let undoStack: GraphHistorySnapshot[] = [];
@@ -258,6 +281,7 @@ let nodeGhostPosition: Point | null = null;
 let edgeLabelMeasureContext: CanvasRenderingContext2D | null = null;
 let zoom = 1;
 let themeMode: ThemeMode = loadThemeMode();
+let snapToGrid = loadSnapToGrid();
 let exportMenuOpen = false;
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -319,6 +343,10 @@ app.innerHTML = `
         <button class="tool-button" id="auto-layout" type="button" title="Auto layout">
           <i data-lucide="workflow"></i>
           <span id="layout-action-label">Auto Layout</span>
+        </button>
+        <button class="tool-button" id="snap-grid" type="button" title="Snap nodes to the grid" aria-pressed="true">
+          <i data-lucide="magnet"></i>
+          <span>Snap</span>
         </button>
         <span class="toolbar-separator" aria-hidden="true"></span>
         <div class="zoom-control" aria-label="Canvas zoom">
@@ -445,6 +473,7 @@ const canvasScroll = must<HTMLDivElement>("#canvas-scroll");
 const themeToggle = must<HTMLButtonElement>("#theme-toggle");
 const themeLabel = must<HTMLSpanElement>("#theme-label");
 const autoLayoutButton = must<HTMLButtonElement>("#auto-layout");
+const snapGridButton = must<HTMLButtonElement>("#snap-grid");
 const layoutActionLabel = must<HTMLSpanElement>("#layout-action-label");
 const zoomLevel = must<HTMLSpanElement>("#zoom-level");
 const zoomOutButton = must<HTMLButtonElement>("#zoom-out");
@@ -535,6 +564,10 @@ autoLayoutButton.addEventListener("click", () => {
   void autoArrange();
 });
 
+snapGridButton.addEventListener("click", () => {
+  setSnapToGrid(!snapToGrid);
+});
+
 zoomOutButton.addEventListener("click", () => {
   setZoom(zoom / ZOOM_STEP);
 });
@@ -574,7 +607,7 @@ graphSpace.addEventListener("pointermove", (event) => {
 
   const point = getCanvasPoint(event.clientX, event.clientY);
 
-  nodeGhostPosition = clampNodePosition(point.x - 105, point.y - 58);
+  nodeGhostPosition = positionNodeForPlacement(point.x - 105, point.y - 58);
   renderNodeGhost();
 });
 
@@ -597,7 +630,7 @@ graphSpace.addEventListener("pointerdown", (event) => {
   const point = getCanvasPoint(event.clientX, event.clientY);
 
   if (activeTool === "node") {
-    const ghostPosition = nodeGhostPosition ?? clampNodePosition(point.x - 105, point.y - 58);
+    const ghostPosition = nodeGhostPosition ?? positionNodeForPlacement(point.x - 105, point.y - 58);
     addNodeAt(ghostPosition.x, ghostPosition.y);
     return;
   }
@@ -715,7 +748,7 @@ function captureGraphHistorySnapshot(): GraphHistorySnapshot {
   return {
     world: { ...world },
     nodes: nodes.map((node) => ({ ...node })),
-    edges: edges.map((edge) => ({ ...edge })),
+    edges: edges.map(cloneEdge),
     selectedNodeId,
     selectedEdgeId,
   };
@@ -723,13 +756,19 @@ function captureGraphHistorySnapshot(): GraphHistorySnapshot {
 
 function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
   nodes = snapshot.nodes.map((node) => ({ ...node }));
-  edges = snapshot.edges.map((edge) => ({ ...edge }));
+  edges = snapshot.edges.map(cloneEdge);
   selectedNodeId = snapshot.selectedNodeId;
   selectedEdgeId = snapshot.selectedEdgeId;
   pendingConnectionFrom = null;
   activeTool = "select";
   nodeGhostPosition = null;
   dragState = null;
+  edgeRouteDragState = null;
+  edgeLabelDragState = null;
+  window.removeEventListener("pointermove", handleEdgeRouteDragMove);
+  window.removeEventListener("pointermove", handleEdgeLabelDragMove);
+  window.removeEventListener("pointerup", finishEdgeRouteDrag);
+  window.removeEventListener("pointerup", finishEdgeLabelDrag);
   nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
   edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
   graphvizLayout = null;
@@ -834,7 +873,7 @@ function updateHistoryControls() {
 
 function addNodeAt(x: number, y: number) {
   withGraphEdit(() => {
-    const position = clampNodePosition(x, y);
+    const position = positionNodeForPlacement(x, y);
     const node: PuzzleNode = {
       id: `n-custom-${nodeSerial}`,
       title: `Puzzle ${nodeSerial}`,
@@ -1060,7 +1099,7 @@ function createGraphDocument(): GraphDocumentV1 {
     description: currentGraph?.description,
     world: { ...world },
     nodes: nodes.map((node) => ({ ...node })),
-    edges: edges.map((edge) => ({ ...edge })),
+    edges: edges.map(cloneEdge),
   };
 }
 
@@ -1487,6 +1526,48 @@ function measureExportText(text: string, font: string) {
 }
 
 function exportRouteForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
+  return routeForEdge(edge);
+}
+
+function routeForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
+  const baseRoute = baseRouteForEdge(edge);
+
+  if (!baseRoute) {
+    return null;
+  }
+
+  const manualPoints = edge.manualRoute ? routePointsForEdge(edge, edge.manualRoute) : null;
+
+  if (!manualPoints) {
+    const basePoints = pathPointsFromSvgPath(baseRoute.path);
+    const manualLabelPoint =
+      typeof edge.manualLabelPosition === "number"
+        ? pointAtPolylinePosition(basePoints, edge.manualLabelPosition)
+        : null;
+
+    return manualLabelPoint
+      ? {
+          ...baseRoute,
+          labelX: manualLabelPoint.x,
+          labelY: manualLabelPoint.y,
+        }
+      : baseRoute;
+  }
+
+  const labelPoint =
+    typeof edge.manualLabelPosition === "number"
+      ? pointAtPolylinePosition(manualPoints, edge.manualLabelPosition)
+      : pointAtPolylinePosition(manualPoints, 0.5);
+
+  return {
+    path: orthogonalPath(manualPoints),
+    arrowPoints: arrowForRoute(manualPoints),
+    labelX: labelPoint.x,
+    labelY: labelPoint.y,
+  };
+}
+
+function baseRouteForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
   const graphvizRoute = graphvizLayout?.edges.get(edge.id);
 
   if (graphvizRoute) {
@@ -1509,6 +1590,128 @@ function exportRouteForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
     labelX: (start.x + end.x) / 2,
     labelY: (start.y + end.y) / 2,
   };
+}
+
+function routePointsForEdge(edge: DependencyEdge, points: Point[]) {
+  const routePoints = cleanManualRoutePoints(points);
+
+  if (routePoints.length < 2) {
+    return null;
+  }
+
+  const from = getNode(edge.from);
+  const to = getNode(edge.to);
+
+  if (!from || !to) {
+    return routePoints;
+  }
+
+  const adjusted = routePoints.map((point) => ({ ...point }));
+  adjusted[0] = anchorPointForNode(from, adjusted[1]);
+  adjusted[adjusted.length - 1] = anchorPointForNode(to, adjusted[adjusted.length - 2]);
+
+  return cleanManualRoutePoints(orthogonalizeEndpointSegments(adjusted, from, to));
+}
+
+function anchorPointForNode(node: PuzzleNode, neighbor: Point): Point {
+  const left = node.x;
+  const right = node.x + node.width;
+  const top = node.y;
+  const bottom = node.y + node.height;
+  const centerX = node.x + node.width / 2;
+  const centerY = node.y + node.height / 2;
+  const dx = neighbor.x - centerX;
+  const dy = neighbor.y - centerY;
+  const horizontalWeight = Math.abs(dx) / Math.max(node.width, 1);
+  const verticalWeight = Math.abs(dy) / Math.max(node.height, 1);
+  const inset = 16;
+
+  if (horizontalWeight >= verticalWeight) {
+    return {
+      x: dx >= 0 ? right : left,
+      y: clamp(neighbor.y, top + inset, bottom - inset),
+    };
+  }
+
+  return {
+    x: clamp(neighbor.x, left + inset, right - inset),
+    y: dy >= 0 ? bottom : top,
+  };
+}
+
+function arrowForRoute(points: Point[]) {
+  const end = points[points.length - 1];
+
+  if (!end) {
+    return [];
+  }
+
+  for (let index = points.length - 2; index >= 0; index -= 1) {
+    const start = points[index];
+
+    if (start && distanceBetween(start, end) > 0.1) {
+      return arrowForLine(start, end);
+    }
+  }
+
+  return [];
+}
+
+function orthogonalizeEndpointSegments(points: Point[], from: PuzzleNode, to: PuzzleNode) {
+  if (points.length < 2) {
+    return points;
+  }
+
+  const result = points.map((point) => ({ ...point }));
+  const first = result[0];
+  const second = result[1];
+
+  if (first && second && !isOrthogonalSegment(first, second)) {
+    result.splice(1, 0, bendPointForNodeAnchor(first, second, from));
+  }
+
+  const last = result[result.length - 1];
+  const penultimate = result[result.length - 2];
+
+  if (last && penultimate && !isOrthogonalSegment(penultimate, last)) {
+    result.splice(result.length - 1, 0, bendPointForNodeAnchor(last, penultimate, to));
+  }
+
+  return result;
+}
+
+function isOrthogonalSegment(start: Point, end: Point) {
+  return Math.abs(start.x - end.x) < 0.1 || Math.abs(start.y - end.y) < 0.1;
+}
+
+function bendPointForNodeAnchor(anchor: Point, neighbor: Point, node: PuzzleNode): Point {
+  const side = nodeAnchorSide(node, anchor);
+
+  return side === "left" || side === "right"
+    ? { x: neighbor.x, y: anchor.y }
+    : { x: anchor.x, y: neighbor.y };
+}
+
+function nodeAnchorSide(node: PuzzleNode, anchor: Point) {
+  const leftDistance = Math.abs(anchor.x - node.x);
+  const rightDistance = Math.abs(anchor.x - (node.x + node.width));
+  const topDistance = Math.abs(anchor.y - node.y);
+  const bottomDistance = Math.abs(anchor.y - (node.y + node.height));
+  const smallest = Math.min(leftDistance, rightDistance, topDistance, bottomDistance);
+
+  if (smallest === leftDistance) {
+    return "left";
+  }
+
+  if (smallest === rightDistance) {
+    return "right";
+  }
+
+  if (smallest === topDistance) {
+    return "top";
+  }
+
+  return "bottom";
 }
 
 function arrowForLine(start: Point, end: Point) {
@@ -1543,6 +1746,282 @@ function pathPointsFromSvgPath(path: string) {
   }
 
   return points;
+}
+
+function movedRoutePoints(state: EdgeRouteDragState, point: Point) {
+  const points = state.originalPoints.map((routePoint) => ({ ...routePoint }));
+  const start = points[state.segmentIndex];
+  const end = points[state.segmentIndex + 1];
+
+  if (!start || !end) {
+    return points;
+  }
+
+  const deltaX = point.x - state.startPoint.x;
+  const deltaY = point.y - state.startPoint.y;
+
+  if (state.orientation === "horizontal") {
+    const nextY = routeDragCoordinate((start.y + end.y) / 2 + deltaY, "y");
+    points[state.segmentIndex] = { ...start, y: nextY };
+    points[state.segmentIndex + 1] = { ...end, y: nextY };
+  } else if (state.orientation === "vertical") {
+    const nextX = routeDragCoordinate((start.x + end.x) / 2 + deltaX, "x");
+    points[state.segmentIndex] = { ...start, x: nextX };
+    points[state.segmentIndex + 1] = { ...end, x: nextX };
+  } else {
+    points[state.segmentIndex] = clampPointToWorld({ x: start.x + deltaX, y: start.y + deltaY });
+    points[state.segmentIndex + 1] = clampPointToWorld({ x: end.x + deltaX, y: end.y + deltaY });
+  }
+
+  return cleanManualRoutePoints(points);
+}
+
+function cleanManualRoutePoints(points: Point[]) {
+  return simplifyRoutePoints(manhattanizeRoutePoints(compactRoutePoints(points.map(clampPointToWorld))));
+}
+
+function manhattanizeRoutePoints(points: Point[]) {
+  if (points.length < 2) {
+    return points;
+  }
+
+  const result: Point[] = [{ ...points[0] }];
+
+  for (const point of points.slice(1)) {
+    const previous = result[result.length - 1];
+
+    if (!previous) {
+      result.push({ ...point });
+      continue;
+    }
+
+    if (!isOrthogonalSegment(previous, point)) {
+      const beforePrevious = result[result.length - 2];
+      result.push(bendPointForSegment(previous, point, beforePrevious));
+    }
+
+    result.push({ ...point });
+  }
+
+  return result;
+}
+
+function bendPointForSegment(start: Point, end: Point, previous?: Point) {
+  const previousOrientation = previous ? segmentOrientation(previous, start) : null;
+
+  if (previousOrientation === "vertical") {
+    return { x: start.x, y: end.y };
+  }
+
+  if (previousOrientation === "horizontal") {
+    return { x: end.x, y: start.y };
+  }
+
+  return Math.abs(end.x - start.x) >= Math.abs(end.y - start.y)
+    ? { x: end.x, y: start.y }
+    : { x: start.x, y: end.y };
+}
+
+function simplifyRoutePoints(points: Point[]) {
+  let simplified = compactRoutePoints(points);
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+
+    for (let index = 1; index < simplified.length - 1; index += 1) {
+      const previous = simplified[index - 1];
+      const point = simplified[index];
+      const next = simplified[index + 1];
+
+      if (areCollinear(previous, point, next)) {
+        simplified = [...simplified.slice(0, index), ...simplified.slice(index + 1)];
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  return compactRoutePoints(simplified);
+}
+
+function areCollinear(a: Point, b: Point, c: Point) {
+  return (
+    (Math.abs(a.x - b.x) < 0.1 && Math.abs(b.x - c.x) < 0.1) ||
+    (Math.abs(a.y - b.y) < 0.1 && Math.abs(b.y - c.y) < 0.1)
+  );
+}
+
+function routeDragCoordinate(value: number, axis: "x" | "y") {
+  const max = axis === "x" ? world.width : world.height;
+
+  if (snapToGrid) {
+    return snapCoordinateWithin(value, 0, max);
+  }
+
+  return clamp(value, 0, max);
+}
+
+function segmentOrientation(start: Point, end: Point): EdgeSegmentOrientation {
+  const deltaX = Math.abs(end.x - start.x);
+  const deltaY = Math.abs(end.y - start.y);
+
+  if (deltaX < 1 && deltaY < 1) {
+    return "free";
+  }
+
+  return deltaX >= deltaY ? "horizontal" : "vertical";
+}
+
+function nearestRouteSegmentIndex(point: Point, points: Point[]) {
+  if (points.length < 2) {
+    return null;
+  }
+
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const distance = distanceToSegment(point, points[index], points[index + 1]);
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+
+  return bestIndex;
+}
+
+function nearestPolylinePosition(point: Point, points: Point[]) {
+  const totalLength = polylineLength(points);
+
+  if (totalLength === 0) {
+    return 0.5;
+  }
+
+  let bestDistance = Number.POSITIVE_INFINITY;
+  let bestDistanceAlongPath = 0;
+  let travelled = 0;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const start = points[index];
+    const end = points[index + 1];
+    const segmentLength = distanceBetween(start, end);
+
+    if (segmentLength === 0) {
+      continue;
+    }
+
+    const projection = projectedPointOnSegment(point, start, end);
+    const distance = distanceBetween(point, projection.point);
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestDistanceAlongPath = travelled + segmentLength * projection.t;
+    }
+
+    travelled += segmentLength;
+  }
+
+  return clamp(bestDistanceAlongPath / totalLength, 0, 1);
+}
+
+function pointAtPolylinePosition(points: Point[], position: number): Point {
+  if (points.length === 0) {
+    return { x: 0, y: 0 };
+  }
+
+  if (points.length === 1) {
+    return points[0];
+  }
+
+  const totalLength = polylineLength(points);
+
+  if (totalLength === 0) {
+    return midpoint(points);
+  }
+
+  const targetDistance = clamp(position, 0, 1) * totalLength;
+  let travelled = 0;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const start = points[index];
+    const end = points[index + 1];
+    const segmentLength = distanceBetween(start, end);
+
+    if (segmentLength === 0) {
+      continue;
+    }
+
+    if (travelled + segmentLength >= targetDistance) {
+      const t = (targetDistance - travelled) / segmentLength;
+
+      return {
+        x: start.x + (end.x - start.x) * t,
+        y: start.y + (end.y - start.y) * t,
+      };
+    }
+
+    travelled += segmentLength;
+  }
+
+  return points[points.length - 1];
+}
+
+function polylineLength(points: Point[]) {
+  let length = 0;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    length += distanceBetween(points[index], points[index + 1]);
+  }
+
+  return length;
+}
+
+function distanceToSegment(point: Point, start: Point, end: Point) {
+  return distanceBetween(point, projectedPointOnSegment(point, start, end).point);
+}
+
+function projectedPointOnSegment(point: Point, start: Point, end: Point) {
+  const deltaX = end.x - start.x;
+  const deltaY = end.y - start.y;
+  const lengthSquared = deltaX * deltaX + deltaY * deltaY;
+
+  if (lengthSquared === 0) {
+    return { point: start, t: 0 };
+  }
+
+  const t = clamp(((point.x - start.x) * deltaX + (point.y - start.y) * deltaY) / lengthSquared, 0, 1);
+
+  return {
+    point: {
+      x: start.x + deltaX * t,
+      y: start.y + deltaY * t,
+    },
+    t,
+  };
+}
+
+function clampPointToWorld(point: Point): Point {
+  return {
+    x: clamp(point.x, 0, world.width),
+    y: clamp(point.y, 0, world.height),
+  };
+}
+
+function compactRoutePoints(points: Point[]) {
+  const compacted: Point[] = [];
+
+  for (const point of points) {
+    const previous = compacted[compacted.length - 1];
+
+    if (!previous || distanceBetween(previous, point) > 0.1) {
+      compacted.push(point);
+    }
+  }
+
+  return compacted;
 }
 
 function renderGraphToSvgBlob() {
@@ -2060,6 +2539,7 @@ async function autoArrange(options: { confirm?: boolean } = {}) {
     };
   });
 
+  edges = edges.map(clearEdgeLayoutOverrides);
   selectedEdgeId = null;
   canvasScroll.scrollLeft = 0;
   canvasScroll.scrollTop = 0;
@@ -2094,6 +2574,7 @@ function applyGraphvizAutoLayout() {
     };
   });
 
+  edges = edges.map(clearEdgeLayoutOverrides);
   graphvizLayout = layout;
   graphvizRoutingDirty = false;
   selectedEdgeId = null;
@@ -2227,6 +2708,7 @@ function renderToolbar() {
   }
 
   updateHistoryControls();
+  updateSnapGridControl();
   layoutActionLabel.textContent = "Auto Layout";
   autoLayoutButton.title = "Rearrange nodes by dependency layers";
 }
@@ -2325,7 +2807,7 @@ function renderNodeGhost() {
 function renderEdges() {
   const edgeMarkup = edges
     .map((edge) => {
-      const route = graphvizLayout?.edges.get(edge.id);
+      const route = routeForEdge(edge);
 
       if (!route) {
         return "";
@@ -2337,8 +2819,8 @@ function renderEdges() {
       const labelMetrics = measureEdgeLabel(rawLabel);
       const labelMarkup = rawLabel
         ? `
-          <rect class="edge-label-bg edge-pick" data-edge-id="${escapeHtml(edge.id)}" x="${route.labelX - labelMetrics.width / 2}" y="${route.labelY - labelMetrics.height / 2}" width="${labelMetrics.width}" height="${labelMetrics.height}" rx="6"></rect>
-          <text class="edge-label edge-pick" data-edge-id="${escapeHtml(edge.id)}" x="${route.labelX}" y="${route.labelY + 4}">${label}</text>
+          <rect class="edge-label-bg edge-pick edge-label-pick" data-edge-id="${escapeHtml(edge.id)}" x="${route.labelX - labelMetrics.width / 2}" y="${route.labelY - labelMetrics.height / 2}" width="${labelMetrics.width}" height="${labelMetrics.height}" rx="6"></rect>
+          <text class="edge-label edge-pick edge-label-pick" data-edge-id="${escapeHtml(edge.id)}" x="${route.labelX}" y="${route.labelY + 4}">${label}</text>
         `
         : "";
       const arrowPoints = route.arrowPoints
@@ -2368,10 +2850,13 @@ function renderEdges() {
       }
 
       event.stopPropagation();
-      selectedEdgeId = edgeId;
-      selectedNodeId = null;
-      pendingConnectionFrom = null;
-      render();
+
+      if (target.classList.contains("edge-label-pick")) {
+        beginEdgeLabelDrag(event, edgeId);
+        return;
+      }
+
+      beginEdgeRouteDrag(event, edgeId);
     });
   });
 }
@@ -2488,6 +2973,16 @@ function renderInspector() {
   }
 
   if (selectedEdge) {
+    const routeReset = selectedEdge.manualRoute
+      ? `<button class="secondary-button" id="reset-edge-route" type="button">Reset Route</button>`
+      : "";
+    const labelReset =
+      typeof selectedEdge.manualLabelPosition === "number"
+        ? `<button class="secondary-button" id="reset-edge-label" type="button">Reset Label</button>`
+        : "";
+    const layoutActions =
+      routeReset || labelReset ? `<div class="edge-layout-actions">${routeReset}${labelReset}</div>` : "";
+
     inspector.innerHTML = `
       <div class="field-group">
         <label for="edge-label">Dependency Token</label>
@@ -2505,6 +3000,7 @@ function renderInspector() {
         <h3>To</h3>
         <p>${escapeHtml(getNode(selectedEdge.to)?.title ?? selectedEdge.to)}</p>
       </div>
+      ${layoutActions}
       <button class="danger-button" id="delete-selection" type="button">
         <i data-lucide="trash-2"></i>
         <span>Delete Edge</span>
@@ -2594,6 +3090,20 @@ function bindEdgeInspector(edgeId: string) {
     });
   });
 
+  inspector.querySelector<HTMLButtonElement>("#reset-edge-route")?.addEventListener("click", () => {
+    withGraphEdit(() => {
+      clearEdgeRouteOverride(edgeId);
+      render();
+    });
+  });
+
+  inspector.querySelector<HTMLButtonElement>("#reset-edge-label")?.addEventListener("click", () => {
+    withGraphEdit(() => {
+      clearEdgeLabelOverride(edgeId);
+      render();
+    });
+  });
+
   must<HTMLButtonElement>("#delete-selection").addEventListener("click", () => {
     deleteSelection();
   });
@@ -2615,6 +3125,138 @@ function bindGraphEditTransaction(element: HTMLElement) {
   element.addEventListener("blur", () => {
     commitGraphEdit();
   });
+}
+
+function beginEdgeRouteDrag(event: PointerEvent, edgeId: string) {
+  const edge = getEdge(edgeId);
+  const route = edge ? routeForEdge(edge) : null;
+
+  selectedEdgeId = edgeId;
+  selectedNodeId = null;
+  pendingConnectionFrom = null;
+
+  if (!edge || !route) {
+    render();
+    return;
+  }
+
+  const points = routePointsForEdge(edge, pathPointsFromSvgPath(route.path));
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  const segmentIndex = points ? nearestRouteSegmentIndex(point, points) : null;
+
+  if (!points || segmentIndex === null) {
+    render();
+    return;
+  }
+
+  event.preventDefault();
+  beginGraphEdit();
+  edgeRouteDragState = {
+    edgeId,
+    segmentIndex,
+    orientation: segmentOrientation(points[segmentIndex], points[segmentIndex + 1]),
+    startPoint: point,
+    originalPoints: points,
+  };
+
+  window.addEventListener("pointermove", handleEdgeRouteDragMove);
+  window.addEventListener("pointerup", finishEdgeRouteDrag, { once: true });
+  render();
+}
+
+function handleEdgeRouteDragMove(event: PointerEvent) {
+  if (!edgeRouteDragState) {
+    return;
+  }
+
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  const nextPoints = movedRoutePoints(edgeRouteDragState, point);
+  updateEdge(edgeRouteDragState.edgeId, { manualRoute: nextPoints });
+  renderEdges();
+}
+
+function finishEdgeRouteDrag() {
+  edgeRouteDragState = null;
+  window.removeEventListener("pointermove", handleEdgeRouteDragMove);
+  render();
+  commitGraphEdit();
+}
+
+function beginEdgeLabelDrag(event: PointerEvent, edgeId: string) {
+  const edge = getEdge(edgeId);
+  const route = edge ? routeForEdge(edge) : null;
+
+  selectedEdgeId = edgeId;
+  selectedNodeId = null;
+  pendingConnectionFrom = null;
+
+  if (!edge || !route) {
+    render();
+    return;
+  }
+
+  const points = pathPointsFromSvgPath(route.path);
+
+  if (points.length < 2) {
+    render();
+    return;
+  }
+
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  const routeLabelPoint = { x: route.labelX, y: route.labelY };
+  const originalPosition =
+    typeof edge.manualLabelPosition === "number"
+      ? edge.manualLabelPosition
+      : nearestPolylinePosition(routeLabelPoint, points);
+
+  event.preventDefault();
+  beginGraphEdit();
+  edgeLabelDragState = {
+    edgeId,
+    originalPosition,
+    startPointerPosition: nearestPolylinePosition(point, points),
+  };
+
+  window.addEventListener("pointermove", handleEdgeLabelDragMove);
+  window.addEventListener("pointerup", finishEdgeLabelDrag, { once: true });
+  render();
+}
+
+function handleEdgeLabelDragMove(event: PointerEvent) {
+  if (!edgeLabelDragState) {
+    return;
+  }
+
+  const edge = getEdge(edgeLabelDragState.edgeId);
+  const route = edge ? routeForEdge(edge) : null;
+
+  if (!edge || !route) {
+    return;
+  }
+
+  const points = pathPointsFromSvgPath(route.path);
+
+  if (points.length < 2) {
+    return;
+  }
+
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  const pointerPosition = nearestPolylinePosition(point, points);
+  const manualLabelPosition = clamp(
+    edgeLabelDragState.originalPosition + pointerPosition - edgeLabelDragState.startPointerPosition,
+    0,
+    1,
+  );
+
+  updateEdge(edgeLabelDragState.edgeId, { manualLabelPosition });
+  renderEdges();
+}
+
+function finishEdgeLabelDrag() {
+  edgeLabelDragState = null;
+  window.removeEventListener("pointermove", handleEdgeLabelDragMove);
+  render();
+  commitGraphEdit();
 }
 
 function handleNodePointerDown(event: PointerEvent, nodeId: string) {
@@ -2661,10 +3303,11 @@ function handleDragMove(event: PointerEvent) {
   }
 
   const point = getCanvasPoint(event.clientX, event.clientY);
+  const position = positionNodeForDrag(point.x - dragState.offsetX, point.y - dragState.offsetY);
 
   updateNode(dragState.nodeId, {
-    x: clamp(point.x - dragState.offsetX, 30, world.width - 250),
-    y: clamp(point.y - dragState.offsetY, 42, world.height - 150),
+    x: position.x,
+    y: position.y,
   });
 
   if (isRoutedNode(dragState.nodeId)) {
@@ -2688,6 +3331,34 @@ function updateNode(nodeId: string, patch: Partial<PuzzleNode>) {
 
 function updateEdge(edgeId: string, patch: Partial<DependencyEdge>) {
   edges = edges.map((edge) => (edge.id === edgeId ? { ...edge, ...patch } : edge));
+}
+
+function clearEdgeRouteOverride(edgeId: string) {
+  edges = edges.map((edge) => {
+    if (edge.id !== edgeId) {
+      return edge;
+    }
+
+    const next = { ...edge };
+    delete next.manualRoute;
+    return next;
+  });
+}
+
+function clearEdgeLabelOverride(edgeId: string) {
+  edges = edges.map((edge) => {
+    if (edge.id !== edgeId) {
+      return edge;
+    }
+
+    const next = { ...edge };
+    delete next.manualLabelPosition;
+    return next;
+  });
+}
+
+function getEdge(edgeId: string) {
+  return edges.find((edge) => edge.id === edgeId);
 }
 
 function getRoutedNodeIds() {
@@ -3074,7 +3745,7 @@ function edgeLabelAttachmentReport() {
   return edges
     .filter((edge) => edge.label.trim())
     .map((edge) => {
-      const route = graphvizLayout?.edges.get(edge.id);
+      const route = routeForEdge(edge);
 
       if (!route) {
         return {
@@ -3570,6 +4241,49 @@ function clampNodePosition(x: number, y: number): Point {
   };
 }
 
+function positionNodeForPlacement(x: number, y: number): Point {
+  if (!snapToGrid) {
+    return clampNodePosition(x, y);
+  }
+
+  return {
+    x: snapCoordinateWithin(x, 40, world.width - 260),
+    y: snapCoordinateWithin(y, 60, world.height - 180),
+  };
+}
+
+function positionNodeForDrag(x: number, y: number): Point {
+  if (!snapToGrid) {
+    return {
+      x: clamp(x, 30, world.width - 250),
+      y: clamp(y, 42, world.height - 150),
+    };
+  }
+
+  return {
+    x: snapCoordinateWithin(x, 30, world.width - 250),
+    y: snapCoordinateWithin(y, 42, world.height - 150),
+  };
+}
+
+function snapCoordinate(value: number) {
+  return Math.round(value / SNAP_GRID_SIZE) * SNAP_GRID_SIZE;
+}
+
+function snapCoordinateWithin(value: number, min: number, max: number) {
+  const snapped = snapCoordinate(clamp(value, min, max));
+
+  if (snapped < min) {
+    return Math.ceil(min / SNAP_GRID_SIZE) * SNAP_GRID_SIZE;
+  }
+
+  if (snapped > max) {
+    return Math.floor(max / SNAP_GRID_SIZE) * SNAP_GRID_SIZE;
+  }
+
+  return snapped;
+}
+
 function normalizeGraphDocument(value: unknown): GraphDocumentV1 {
   const record = asRecord(value, "Graph file must be an object.");
 
@@ -3639,13 +4353,26 @@ function normalizeGraphEdge(value: unknown): DependencyEdge {
     throw new Error("Graph edge is missing an id, from, or to value.");
   }
 
-  return {
+  const edge: DependencyEdge = {
     id,
     from,
     to,
     label: stringValue(record.label, ""),
     tokenType: isTokenType(record.tokenType) ? record.tokenType : "item",
   };
+
+  const manualRoute = optionalPointArray(record.manualRoute);
+  const manualLabelPosition = optionalUnitNumber(record.manualLabelPosition);
+
+  if (manualRoute) {
+    edge.manualRoute = manualRoute;
+  }
+
+  if (typeof manualLabelPosition === "number") {
+    edge.manualLabelPosition = manualLabelPosition;
+  }
+
+  return edge;
 }
 
 function rememberGraph(document: GraphDocumentV1, sourceName: string, filePath?: string) {
@@ -3758,6 +4485,37 @@ function setTheme(nextTheme: ThemeMode) {
   applyTheme(themeMode);
 }
 
+function loadSnapToGrid() {
+  try {
+    return localStorage.getItem(SNAP_TO_GRID_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function setSnapToGrid(nextSnapToGrid: boolean) {
+  snapToGrid = nextSnapToGrid;
+
+  try {
+    localStorage.setItem(SNAP_TO_GRID_STORAGE_KEY, String(snapToGrid));
+  } catch {
+    // The editor preference can still work for this session without storage.
+  }
+
+  if (activeTool === "node" && nodeGhostPosition) {
+    nodeGhostPosition = positionNodeForPlacement(nodeGhostPosition.x, nodeGhostPosition.y);
+    renderNodeGhost();
+  }
+
+  updateSnapGridControl();
+}
+
+function updateSnapGridControl() {
+  snapGridButton.classList.toggle("active", snapToGrid);
+  snapGridButton.setAttribute("aria-pressed", String(snapToGrid));
+  snapGridButton.title = snapToGrid ? "Snap to grid is on" : "Snap to grid is off";
+}
+
 function applyTheme(nextTheme: ThemeMode) {
   document.documentElement.dataset.theme = nextTheme;
   themeToggle.setAttribute("aria-pressed", String(nextTheme === "dark"));
@@ -3776,6 +4534,21 @@ function saveRecentGraphs() {
 
 function cloneGraphDocument(document: GraphDocumentV1): GraphDocumentV1 {
   return JSON.parse(JSON.stringify(document)) as GraphDocumentV1;
+}
+
+function cloneEdge(edge: DependencyEdge): DependencyEdge {
+  return {
+    ...edge,
+    manualRoute: edge.manualRoute?.map((point) => ({ ...point })),
+  };
+}
+
+function clearEdgeLayoutOverrides(edge: DependencyEdge): DependencyEdge {
+  const next = { ...edge };
+  delete next.manualRoute;
+  delete next.manualLabelPosition;
+
+  return next;
 }
 
 function recentGraphId(title: string, sourceName: string) {
@@ -3828,6 +4601,31 @@ function finiteNumber(value: unknown, fallback: number) {
 
 function optionalPositiveNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function optionalUnitNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? clamp(value, 0, 1) : undefined;
+}
+
+function optionalPointArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const points = value
+    .map((point) => {
+      if (!isRecord(point)) {
+        return null;
+      }
+
+      const x = typeof point.x === "number" && Number.isFinite(point.x) ? point.x : null;
+      const y = typeof point.y === "number" && Number.isFinite(point.y) ? point.y : null;
+
+      return x === null || y === null ? null : { x, y };
+    })
+    .filter((point): point is Point => point !== null);
+
+  return points.length >= 2 ? simplifyRoutePoints(manhattanizeRoutePoints(compactRoutePoints(points))) : undefined;
 }
 
 function optionalDifficulty(value: unknown) {
@@ -3960,6 +4758,7 @@ function hydrateIcons() {
       History,
       House,
       Layers3,
+      Magnet,
       Maximize2,
       Moon,
       MousePointer2,

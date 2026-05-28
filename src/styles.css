@@ -309,6 +309,29 @@ button {
     var(--md-error-container);
 }
 
+.edge-layout-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 14px 0 0;
+}
+
+.secondary-button {
+  min-height: 40px;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: 20px;
+  color: var(--md-on-secondary-container);
+  background: var(--md-secondary-container);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.secondary-button:hover {
+  background:
+    linear-gradient(var(--state-hover), var(--state-hover)),
+    var(--md-secondary-container);
+}
+
 .theme-toggle {
   grid-column: 3;
   justify-self: end;
@@ -766,11 +789,7 @@ button {
   position: absolute;
   inset: 24px 0 0 24px;
   overflow: auto;
-  background:
-    linear-gradient(var(--canvas-grid) 1px, transparent 1px),
-    linear-gradient(90deg, var(--canvas-grid) 1px, transparent 1px),
-    var(--md-surface);
-  background-size: 24px 24px;
+  background: var(--md-surface);
 }
 
 .graph-space {
@@ -832,22 +851,23 @@ button {
   fill: none;
   stroke: transparent;
   stroke-width: 18;
-  cursor: pointer;
+  cursor: grab;
   pointer-events: stroke;
 }
 
 .edge-label-bg {
   fill: var(--edge-label-surface);
   stroke: var(--md-outline-variant);
-  cursor: pointer;
+  cursor: grab;
 }
 
 .edge-label {
   fill: var(--md-on-surface-variant);
   font-size: 12px;
   text-anchor: middle;
-  cursor: pointer;
+  cursor: grab;
   pointer-events: visiblePainted;
+  user-select: none;
 }
 
 .edge-group.selected .edge-label-bg {
