@@ -2015,7 +2015,15 @@ function isExportFormat(value: unknown): value is ExportFormat {
   return value === "png" || value === "jpg" || value === "pdf" || value === "svg";
 }
 
-function autoArrange() {
+function confirmAutoLayout() {
+  return window.confirm("Auto Layout will rearrange every node in this graph. You can undo it afterward. Continue?");
+}
+
+function autoArrange(options: { confirm?: boolean } = {}) {
+  if (options.confirm !== false && !confirmAutoLayout()) {
+    return;
+  }
+
   beginGraphEdit();
 
   if (graphviz) {
@@ -3973,7 +3981,7 @@ function installDebugApi() {
 
   window.__depdoodleDebug = {
     autoLayout: () => {
-      autoArrange();
+      autoArrange({ confirm: false });
     },
     labelAttachmentReport: edgeLabelAttachmentReport,
     loadGraph: (document) => {
