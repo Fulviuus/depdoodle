@@ -158,7 +158,7 @@ button {
 
 .brand {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 12px;
   min-width: 0;
 }
@@ -330,6 +330,18 @@ button {
   background:
     linear-gradient(var(--state-hover), var(--state-hover)),
     var(--md-secondary-container);
+}
+
+.secondary-button.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.full-width-action {
+  width: 100%;
+  margin-top: 14px;
 }
 
 .theme-toggle {
@@ -810,15 +822,22 @@ button {
   overflow: hidden;
 }
 
+.group-layer,
 .edge-layer,
 .node-layer {
   position: absolute;
   inset: 0;
 }
 
+.group-layer {
+  z-index: 0;
+  pointer-events: none;
+}
+
 .edge-layer {
   z-index: 1;
   overflow: visible;
+  pointer-events: none;
 }
 
 .node-layer {
@@ -833,6 +852,82 @@ button {
   border-radius: 4px;
   background: color-mix(in srgb, var(--md-primary) 14%, transparent);
   pointer-events: none;
+}
+
+.group-box {
+  position: absolute;
+  border: 1.5px dashed color-mix(in srgb, var(--group-color, var(--md-primary)) 52%, var(--md-outline-variant));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--group-color, var(--md-primary)) 10%, transparent);
+  cursor: grab;
+  pointer-events: auto;
+  user-select: none;
+}
+
+.group-box:hover {
+  background:
+    linear-gradient(var(--state-hover), var(--state-hover)),
+    color-mix(in srgb, var(--group-color, var(--md-primary)) 10%, transparent);
+}
+
+.group-box:active {
+  cursor: grabbing;
+}
+
+.group-box.selected {
+  border-color: var(--md-primary);
+  border-style: solid;
+  box-shadow: 0 0 0 3px var(--node-selected-ring);
+}
+
+.group-box.hidden {
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      transparent 0 10px,
+      color-mix(in srgb, var(--md-outline-variant) 24%, transparent) 10px 12px
+    ),
+    color-mix(in srgb, var(--group-color, var(--md-primary)) 10%, transparent);
+}
+
+.group-header {
+  position: absolute;
+  top: 9px;
+  left: 12px;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 28px;
+}
+
+.group-name {
+  overflow: hidden;
+  color: var(--md-on-surface-variant);
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-visibility {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  border: 0;
+  border-radius: 50%;
+  color: var(--md-on-surface-variant);
+  background: var(--md-surface-container-lowest);
+  box-shadow: var(--md-elevation-1);
+}
+
+.group-visibility:hover {
+  color: var(--md-on-primary-container);
+  background: var(--md-primary-container);
 }
 
 .edge-path {
@@ -868,6 +963,7 @@ button {
   fill: var(--edge-label-surface);
   stroke: var(--md-outline-variant);
   cursor: grab;
+  pointer-events: all;
 }
 
 .edge-label {

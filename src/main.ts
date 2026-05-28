@@ -2,9 +2,12 @@ import {
   Activity,
   createIcons,
   Download,
+  Eye,
+  EyeOff,
   FilePlus2,
   FolderOpen,
   GitBranchPlus,
+  Group as GroupIcon,
   History,
   House,
   Layers3,
@@ -22,6 +25,7 @@ import {
   TriangleAlert,
   Redo2,
   Undo2,
+  Ungroup,
   Workflow,
 } from "lucide";
 import { Graphviz } from "@hpcc-js/wasm-graphviz";
@@ -58,6 +62,14 @@ interface DependencyEdge {
   manualLabelPosition?: number;
 }
 
+interface PuzzleGroup {
+  id: string;
+  name: string;
+  color: string;
+  nodeIds: string[];
+  hidden: boolean;
+}
+
 interface GraphDocumentV1 {
   format: "depdoodle.graph";
   version: 1;
@@ -69,6 +81,7 @@ interface GraphDocumentV1 {
   };
   nodes: PuzzleNode[];
   edges: DependencyEdge[];
+  groups?: PuzzleGroup[];
 }
 
 interface GraphHistorySnapshot {
@@ -78,9 +91,11 @@ interface GraphHistorySnapshot {
   };
   nodes: PuzzleNode[];
   edges: DependencyEdge[];
+  groups: PuzzleGroup[];
   selectedNodeIds: string[];
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
+  selectedGroupId: string | null;
 }
 
 interface ExportBounds {
@@ -146,6 +161,21 @@ interface SelectionBoxState {
   additive: boolean;
   initialNodeIds: Set<string>;
   hasMoved: boolean;
+}
+
+interface GroupDragState {
+  groupId: string;
+  startPoint: Point;
+  originBounds: Rect;
+  originPositions: Array<{
+    nodeId: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }>;
+  offsetX: number;
+  offsetY: number;
 }
 
 type EdgeSegmentOrientation = "horizontal" | "vertical" | "free";
@@ -252,6 +282,9 @@ const EDGE_LABEL_HORIZONTAL_PADDING = 24;
 const EDGE_LABEL_SIDE_GUTTER = 144;
 const EDGE_LABEL_CLEARANCE = 10;
 const EDGE_ROUTE_CLEARANCE = 8;
+const GROUP_PADDING_X = 32;
+const GROUP_PADDING_TOP = 52;
+const GROUP_PADDING_BOTTOM = 32;
 const GRAPHVIZ_POINTS_PER_INCH = 72;
 const MIN_AUTO_NODESEP = 1.35;
 const MIN_AUTO_RANKSEP = 3.6;
@@ -276,20 +309,24 @@ let world = {
 
 let nodes: PuzzleNode[] = [];
 let edges: DependencyEdge[] = [];
+let groups: PuzzleGroup[] = [];
 let currentGraph: LoadedGraph | null = null;
 let recentGraphs: RecentGraph[] = loadRecentGraphs();
 
 let selectedNodeIds = new Set<string>();
 let selectedNodeId: string | null = null;
 let selectedEdgeId: string | null = null;
+let selectedGroupId: string | null = null;
 let activeTool: Tool = "select";
 let pendingConnectionFrom: string | null = null;
 let dragState: DragState | null = null;
+let groupDragState: GroupDragState | null = null;
 let selectionBoxState: SelectionBoxState | null = null;
 let edgeRouteDragState: EdgeRouteDragState | null = null;
 let edgeLabelDragState: EdgeLabelDragState | null = null;
 let nodeSerial = nodes.length + 1;
 let edgeSerial = edges.length + 1;
+let groupSerial = groups.length + 1;
 let undoStack: GraphHistorySnapshot[] = [];
 let redoStack: GraphHistorySnapshot[] = [];
 let graphEditBefore: GraphHistorySnapshot | null = null;
@@ -314,15 +351,12 @@ app.innerHTML = `
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
-        <strong>DepDoodle</strong>
-        <span>Puzzle Dependency Charts</span>
-      </div>
-      <nav class="toolbar" aria-label="Chart tools">
-        <button class="tool-button" id="back-to-welcome" type="button" title="Back to welcome">
+        <button class="tool-button" id="back-to-welcome" type="button" title="Back to welcome screen" aria-label="Back to welcome screen">
           <i data-lucide="house"></i>
           <span>Welcome</span>
         </button>
-        <span class="toolbar-separator" aria-hidden="true"></span>
+      </div>
+      <nav class="toolbar" aria-label="Chart tools">
         <button class="tool-button" id="save-graph" type="button" title="Save graph as .depdoodle">
           <i data-lucide="save"></i>
           <span>Save</span>
@@ -333,10 +367,10 @@ app.innerHTML = `
             <span>Export</span>
           </button>
           <div class="export-menu" id="export-menu" role="menu" hidden>
-            <button type="button" role="menuitem" data-export-format="png">PNG</button>
-            <button type="button" role="menuitem" data-export-format="jpg">JPG</button>
-            <button type="button" role="menuitem" data-export-format="pdf">PDF</button>
-            <button type="button" role="menuitem" data-export-format="svg">SVG</button>
+            <button type="button" role="menuitem" data-export-format="png" title="Export as PNG">PNG</button>
+            <button type="button" role="menuitem" data-export-format="jpg" title="Export as JPG">JPG</button>
+            <button type="button" role="menuitem" data-export-format="pdf" title="Export as PDF">PDF</button>
+            <button type="button" role="menuitem" data-export-format="svg" title="Export as SVG">SVG</button>
           </div>
         </div>
         <span class="toolbar-separator" aria-hidden="true"></span>
@@ -400,11 +434,11 @@ app.innerHTML = `
         <h1>Puzzle dependency charts editor</h1>
         <p class="welcome-copy">Create a chart, load a saved <code>.depdoodle</code> graph, or reopen recent work.</p>
         <div class="welcome-actions">
-          <button class="welcome-action primary" id="new-graph" type="button">
+          <button class="welcome-action primary" id="new-graph" type="button" title="Create a new graph">
             <i data-lucide="file-plus-2"></i>
             <span>New Graph</span>
           </button>
-          <button class="welcome-action" id="load-graph" type="button">
+          <button class="welcome-action" id="load-graph" type="button" title="Load a .depdoodle graph">
             <i data-lucide="folder-open"></i>
             <span>Load Graph</span>
           </button>
@@ -456,6 +490,7 @@ app.innerHTML = `
         <div class="canvas-scroll" id="canvas-scroll">
           <div class="graph-viewport" id="graph-viewport">
             <div class="graph-space" id="graph-space">
+              <div class="group-layer" id="group-layer"></div>
               <svg class="edge-layer" id="edge-layer" width="${world.width}" height="${world.height}" viewBox="0 0 ${world.width} ${world.height}">
               </svg>
               <div class="node-layer" id="node-layer"></div>
@@ -483,6 +518,7 @@ const welcomeScreen = must<HTMLElement>("#welcome-screen");
 const workbench = must<HTMLDivElement>("#workbench");
 const graphSpace = must<HTMLDivElement>("#graph-space");
 const graphViewport = must<HTMLDivElement>("#graph-viewport");
+const groupLayer = must<HTMLDivElement>("#group-layer");
 const edgeLayer = must<SVGSVGElement>("#edge-layer");
 const nodeLayer = must<HTMLDivElement>("#node-layer");
 const inspector = must<HTMLDivElement>("#inspector");
@@ -643,7 +679,7 @@ graphSpace.addEventListener("pointerleave", () => {
 graphSpace.addEventListener("pointerdown", (event) => {
   const target = event.target as Element;
 
-  if (target.closest(".node") || target.closest(".edge-pick")) {
+  if (target.closest(".node") || target.closest(".edge-pick") || target.closest(".group-box")) {
     return;
   }
 
@@ -775,6 +811,7 @@ function selectOnlyNode(nodeId: string) {
   selectedNodeIds = new Set([nodeId]);
   selectedNodeId = nodeId;
   selectedEdgeId = null;
+  selectedGroupId = null;
   pendingConnectionFrom = null;
 }
 
@@ -785,6 +822,7 @@ function setSelectedNodes(nodeIds: Iterable<string>, primaryNodeId?: string) {
     primaryNodeId && selectedNodeIds.has(primaryNodeId)
       ? primaryNodeId
       : nodes.find((node) => selectedNodeIds.has(node.id))?.id ?? null;
+  selectedGroupId = null;
 
   if (selectedNodeId) {
     selectedEdgeId = null;
@@ -807,6 +845,15 @@ function selectOnlyEdge(edgeId: string) {
   selectedNodeIds = new Set();
   selectedNodeId = null;
   selectedEdgeId = edgeId;
+  selectedGroupId = null;
+  pendingConnectionFrom = null;
+}
+
+function selectOnlyGroup(groupId: string) {
+  selectedNodeIds = new Set();
+  selectedNodeId = null;
+  selectedEdgeId = null;
+  selectedGroupId = groupId;
   pendingConnectionFrom = null;
 }
 
@@ -814,10 +861,18 @@ function clearSelection() {
   selectedNodeIds = new Set();
   selectedNodeId = null;
   selectedEdgeId = null;
+  selectedGroupId = null;
   pendingConnectionFrom = null;
 }
 
 function syncPrimarySelection() {
+  if (selectedGroupId) {
+    selectedNodeIds = new Set();
+    selectedNodeId = null;
+    selectedEdgeId = null;
+    return;
+  }
+
   setSelectedNodes(selectedNodeIds, selectedNodeId ?? undefined);
 }
 
@@ -826,33 +881,44 @@ function captureGraphHistorySnapshot(): GraphHistorySnapshot {
     world: { ...world },
     nodes: nodes.map((node) => ({ ...node })),
     edges: edges.map(cloneEdge),
+    groups: groups.map(cloneGroup),
     selectedNodeIds: [...selectedNodeIds],
     selectedNodeId,
     selectedEdgeId,
+    selectedGroupId,
   };
 }
 
 function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
   nodes = snapshot.nodes.map((node) => ({ ...node }));
   edges = snapshot.edges.map(cloneEdge);
+  groups = snapshot.groups.map(cloneGroup);
   selectedNodeIds = new Set(snapshot.selectedNodeIds ?? (snapshot.selectedNodeId ? [snapshot.selectedNodeId] : []));
   selectedNodeId = snapshot.selectedNodeId;
   selectedEdgeId = snapshot.selectedEdgeId;
+  selectedGroupId = snapshot.selectedGroupId;
   pendingConnectionFrom = null;
   activeTool = "select";
   nodeGhostPosition = null;
   dragState = null;
+  groupDragState = null;
   selectionBoxState = null;
   edgeRouteDragState = null;
   edgeLabelDragState = null;
   renderSelectionBox();
   syncPrimarySelection();
+  if (selectedGroupId && !groups.some((group) => group.id === selectedGroupId)) {
+    selectedGroupId = null;
+  }
   window.removeEventListener("pointermove", handleEdgeRouteDragMove);
   window.removeEventListener("pointermove", handleEdgeLabelDragMove);
+  window.removeEventListener("pointermove", handleGroupDragMove);
   window.removeEventListener("pointerup", finishEdgeRouteDrag);
   window.removeEventListener("pointerup", finishEdgeLabelDrag);
+  window.removeEventListener("pointerup", finishGroupDrag);
   nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
   edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
+  groupSerial = nextSerial(groups.map((group) => group.id), "g-custom-");
   graphvizLayout = null;
   graphvizRoutingDirty = true;
   resizeWorld(snapshot.world.width, snapshot.world.height);
@@ -864,6 +930,7 @@ function graphHistoryDataKey(snapshot: GraphHistorySnapshot) {
     world: snapshot.world,
     nodes: snapshot.nodes,
     edges: snapshot.edges,
+    groups: snapshot.groups,
   });
 }
 
@@ -953,6 +1020,20 @@ function updateHistoryControls() {
   redoButton.title = redoButton.disabled ? "Nothing to redo" : "Redo";
 }
 
+function ensureButtonTooltips(root: ParentNode = document) {
+  root.querySelectorAll<HTMLButtonElement>("button").forEach((button) => {
+    if (button.title.trim()) {
+      return;
+    }
+
+    const label = button.getAttribute("aria-label") ?? button.textContent?.replace(/\s+/g, " ").trim();
+
+    if (label) {
+      button.title = label;
+    }
+  });
+}
+
 function addNodeAt(x: number, y: number) {
   withGraphEdit(() => {
     const position = positionNodeForPlacement(x, y);
@@ -1013,6 +1094,7 @@ function createNewGraph() {
       world: { ...EMPTY_GRAPH_WORLD },
       nodes: [],
       edges: [],
+      groups: [],
     },
     "Unsaved graph",
     false,
@@ -1039,6 +1121,7 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
   const normalized = normalizeGraphDocument(document);
   nodes = normalized.nodes.map((node) => ({ ...node }));
   edges = normalized.edges.map(cloneEdge);
+  groups = (normalized.groups ?? []).map(cloneGroup);
   currentGraph = {
     title: normalized.title,
     sourceName,
@@ -1047,6 +1130,7 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
   };
   nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
   edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
+  groupSerial = nextSerial(groups.map((group) => group.id), "g-custom-");
   clearSelection();
   activeTool = "select";
   nodeGhostPosition = null;
@@ -1180,6 +1264,7 @@ function createGraphDocument(): GraphDocumentV1 {
     world: { ...world },
     nodes: nodes.map((node) => ({ ...node })),
     edges: edges.map(cloneEdge),
+    groups: groups.map(cloneGroup),
   };
 }
 
@@ -1201,6 +1286,7 @@ function renderGraphToCanvas(): RasterExport {
   context.scale(scale, scale);
   drawExportBackground(context, bounds);
   context.translate(-bounds.left, -bounds.top);
+  drawExportGroups(context);
   drawExportEdges(context);
   drawExportNodes(context);
 
@@ -1211,12 +1297,23 @@ function measureExportBounds(): ExportBounds {
   const xs: number[] = [];
   const ys: number[] = [];
 
-  nodes.forEach((node) => {
+  visibleNodes().forEach((node) => {
     xs.push(node.x, node.x + node.width);
     ys.push(node.y, node.y + node.height);
   });
 
-  edges.forEach((edge) => {
+  groups.forEach((group) => {
+    const bounds = groupBounds(group);
+
+    if (!bounds) {
+      return;
+    }
+
+    xs.push(bounds.left, bounds.right);
+    ys.push(bounds.top, bounds.bottom);
+  });
+
+  visibleEdges().forEach((edge) => {
     const route = exportRouteForEdge(edge);
 
     if (!route) {
@@ -1298,10 +1395,39 @@ function drawExportBackground(context: CanvasRenderingContext2D, bounds: ExportB
   }
 }
 
+function drawExportGroups(context: CanvasRenderingContext2D) {
+  const styles = exportStyles();
+
+  groups.forEach((group) => {
+    const bounds = groupBounds(group);
+
+    if (!bounds) {
+      return;
+    }
+
+    const groupColorValue = groupColor(group);
+    context.save();
+    context.fillStyle = mixCssColors(groupColorValue, styles.groupSurfaceTint, styles.surface);
+    context.strokeStyle = mixCssColors(groupColorValue, styles.groupStrokeTint, styles.outlineVariant);
+    context.lineWidth = 1.5;
+    context.setLineDash([8, 6]);
+    roundedRect(context, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top, 10);
+    context.fill();
+    context.stroke();
+    context.setLineDash([]);
+    context.fillStyle = styles.textVariant;
+    context.font = exportFont(13, 700);
+    context.textBaseline = "middle";
+    context.textAlign = "left";
+    context.fillText(group.name.trim() || "Untitled group", bounds.left + 16, bounds.top + 22, bounds.right - bounds.left - 32);
+    context.restore();
+  });
+}
+
 function drawExportEdges(context: CanvasRenderingContext2D) {
   const styles = exportStyles();
 
-  edges.forEach((edge) => {
+  visibleEdges().forEach((edge) => {
     const route = exportRouteForEdge(edge);
 
     if (!route) {
@@ -1334,7 +1460,7 @@ function drawExportEdges(context: CanvasRenderingContext2D) {
     }
   });
 
-  edges.forEach((edge) => {
+  visibleEdges().forEach((edge) => {
     const route = exportRouteForEdge(edge);
 
     if (!route) {
@@ -1372,7 +1498,7 @@ function drawExportNodes(context: CanvasRenderingContext2D) {
   const roots = new Set(analysis.roots.map((node) => node.id));
   const leaves = new Set(analysis.leaves.map((node) => node.id));
 
-  [...nodes].sort(compareNodesByPosition).forEach((node) => {
+  visibleNodes().sort(compareNodesByPosition).forEach((node) => {
     const nodeColorValue = nodeColor(node);
     const nodeSurface = mixCssColors(nodeColorValue, styles.nodeSurfaceTint, styles.surfaceLowest);
     const borderColor = mixCssColors(nodeColorValue, 0.24, styles.outlineVariant);
@@ -2126,6 +2252,7 @@ function renderGraphToSvg(bounds: ExportBounds) {
   </defs>
   <rect x="${bounds.left}" y="${bounds.top}" width="${bounds.width}" height="${bounds.height}" fill="${escapeAttribute(styles.surface)}" />
   ${svgGrid(bounds, styles)}
+  ${svgGroups(styles)}
   ${svgEdges(styles)}
   ${svgNodes(styles)}
 </svg>
@@ -2148,8 +2275,31 @@ function svgGrid(bounds: ExportBounds, styles: ReturnType<typeof exportStyles>) 
   return `<g stroke="${escapeAttribute(styles.grid)}" stroke-width="1" shape-rendering="crispEdges">${lines.join("")}</g>`;
 }
 
+function svgGroups(styles: ReturnType<typeof exportStyles>) {
+  return groups
+    .map((group) => {
+      const bounds = groupBounds(group);
+
+      if (!bounds) {
+        return "";
+      }
+
+      const width = bounds.right - bounds.left;
+      const height = bounds.bottom - bounds.top;
+      const groupColorValue = groupColor(group);
+      const surface = mixCssColors(groupColorValue, styles.groupSurfaceTint, styles.surface);
+      const stroke = mixCssColors(groupColorValue, styles.groupStrokeTint, styles.outlineVariant);
+
+      return `<g>
+        <rect x="${bounds.left}" y="${bounds.top}" width="${width}" height="${height}" rx="10" fill="${escapeAttribute(surface)}" stroke="${escapeAttribute(stroke)}" stroke-width="1.5" stroke-dasharray="8 6" />
+        <text x="${bounds.left + 16}" y="${bounds.top + 22}" fill="${escapeAttribute(styles.textVariant)}" font-family="${escapeAttribute(EXPORT_FONT_FAMILY)}" font-size="13" font-weight="700" dominant-baseline="middle">${escapeHtml(group.name.trim() || "Untitled group")}</text>
+      </g>`;
+    })
+    .join("");
+}
+
 function svgEdges(styles: ReturnType<typeof exportStyles>) {
-  const edgeLines = edges
+  const edgeLines = visibleEdges()
     .map((edge) => {
       const route = exportRouteForEdge(edge);
 
@@ -2167,7 +2317,7 @@ function svgEdges(styles: ReturnType<typeof exportStyles>) {
       </g>`;
     })
     .join("");
-  const edgeLabels = edges
+  const edgeLabels = visibleEdges()
     .map((edge) => {
       const route = exportRouteForEdge(edge);
       const label = edge.label.trim();
@@ -2194,7 +2344,7 @@ function svgNodes(styles: ReturnType<typeof exportStyles>) {
   const roots = new Set(analysis.roots.map((node) => node.id));
   const leaves = new Set(analysis.leaves.map((node) => node.id));
 
-  return [...nodes]
+  return visibleNodes()
     .sort(compareNodesByPosition)
     .map((node, index) => {
       const nodeColorValue = nodeColor(node);
@@ -2297,6 +2447,8 @@ function exportStyles() {
   return {
     edge: cssVar("--edge-color"),
     edgeLabelSurface: cssVar("--edge-label-surface"),
+    groupStrokeTint: 0.52,
+    groupSurfaceTint: document.documentElement.dataset.theme === "dark" ? 0.18 : 0.1,
     grid: cssVar("--canvas-space-grid"),
     outlineVariant: cssVar("--md-outline-variant"),
     shadow: document.documentElement.dataset.theme === "dark" ? "rgba(0, 0, 0, 0.45)" : "rgba(25, 28, 29, 0.18)",
@@ -2664,6 +2816,11 @@ function applyGraphvizAutoLayout() {
 }
 
 function deleteSelection() {
+  if (selectedGroupId) {
+    void deleteGroupWithConfirmation(selectedGroupId);
+    return;
+  }
+
   if (selectedNodeIds.size > 0) {
     withGraphEdit(() => {
       const nodeIds = new Set(selectedNodeIds);
@@ -2672,9 +2829,7 @@ function deleteSelection() {
         return;
       }
 
-      const affectsRouting = [...nodeIds].some(isRoutedNode);
-      nodes = nodes.filter((node) => !nodeIds.has(node.id));
-      edges = edges.filter((edge) => !nodeIds.has(edge.from) && !nodeIds.has(edge.to));
+      const affectsRouting = deleteNodesById(nodeIds);
       clearSelection();
       if (affectsRouting) {
         markGraphvizRoutingDirty();
@@ -2700,11 +2855,125 @@ function deleteSelection() {
   }
 }
 
+function createGroupFromSelection() {
+  const nodeIds = [...selectedNodeIds].filter((nodeId) => getNode(nodeId));
+
+  if (nodeIds.length < 2) {
+    return;
+  }
+
+  withGraphEdit(() => {
+    const selectedIds = new Set(nodeIds);
+    const group: PuzzleGroup = {
+      id: `g-custom-${groupSerial}`,
+      name: `Group ${groupSerial}`,
+      color: defaultGroupColor(groupSerial),
+      nodeIds,
+      hidden: false,
+    };
+
+    groupSerial += 1;
+    groups = [
+      ...groups
+        .map((candidate) => ({
+          ...candidate,
+          nodeIds: candidate.nodeIds.filter((nodeId) => !selectedIds.has(nodeId)),
+        }))
+        .filter((candidate) => candidate.nodeIds.length > 0),
+      group,
+    ];
+    selectOnlyGroup(group.id);
+    render();
+  });
+}
+
+function toggleGroupHidden(groupId: string) {
+  const group = getGroup(groupId);
+
+  if (!group) {
+    return;
+  }
+
+  withGraphEdit(() => {
+    updateGroup(groupId, { hidden: !group.hidden });
+    selectOnlyGroup(groupId);
+    markGraphvizRoutingDirty();
+    render();
+  });
+}
+
+function ungroup(groupId: string) {
+  const group = getGroup(groupId);
+
+  if (!group) {
+    return;
+  }
+
+  withGraphEdit(() => {
+    groups = groups.filter((candidate) => candidate.id !== groupId);
+    setSelectedNodes(group.nodeIds, group.nodeIds[0]);
+    markGraphvizRoutingDirty();
+    render();
+  });
+}
+
+async function deleteGroupWithConfirmation(groupId: string) {
+  const group = getGroup(groupId);
+
+  if (!group) {
+    return;
+  }
+
+  const memberCount = group.nodeIds.filter((nodeId) => getNode(nodeId)).length;
+  const message = `Delete "${group.name || "Untitled group"}" and its ${memberCount} nodes? This also removes connected dependencies.`;
+  const confirmed = isTauriRuntime()
+    ? await ask(message, {
+        title: "Delete Group",
+        kind: "warning",
+        okLabel: "Delete",
+        cancelLabel: "Cancel",
+      })
+    : window.confirm(message);
+
+  if (!confirmed) {
+    return;
+  }
+
+  withGraphEdit(() => {
+    const affectsRouting = deleteNodesById(new Set(group.nodeIds));
+    groups = groups.filter((candidate) => candidate.id !== groupId);
+    clearSelection();
+    if (affectsRouting) {
+      markGraphvizRoutingDirty();
+    }
+    render();
+  });
+}
+
+function deleteNodesById(nodeIds: Set<string>) {
+  const affectsRouting = [...nodeIds].some(isRoutedNode);
+  nodes = nodes.filter((node) => !nodeIds.has(node.id));
+  edges = edges.filter((edge) => !nodeIds.has(edge.from) && !nodeIds.has(edge.to));
+  groups = groups
+    .map((group) => ({
+      ...group,
+      nodeIds: group.nodeIds.filter((nodeId) => !nodeIds.has(nodeId)),
+    }))
+    .filter((group) => group.nodeIds.length > 0);
+
+  if (selectedGroupId && !groups.some((group) => group.id === selectedGroupId)) {
+    selectedGroupId = null;
+  }
+
+  return affectsRouting;
+}
+
 function render() {
   renderAppMode();
 
   if (!currentGraph) {
     renderWelcome();
+    ensureButtonTooltips();
     hydrateIcons();
     return;
   }
@@ -2713,6 +2982,7 @@ function render() {
   const analysis = analyzeGraph();
 
   renderToolbar();
+  renderGroups();
   renderEdges();
   renderNodes();
   renderSelectionBox();
@@ -2720,6 +2990,7 @@ function render() {
   renderWidthBars(analysis);
   renderWarnings(analysis);
   renderInspector();
+  ensureButtonTooltips();
   hydrateIcons();
 }
 
@@ -2744,7 +3015,7 @@ function renderWelcome() {
     .map(
       (recent) => `
         <div class="recent-item" data-recent-id="${escapeAttribute(recent.id)}">
-          <button class="recent-open" type="button" data-recent-open="${escapeAttribute(recent.id)}">
+          <button class="recent-open" type="button" data-recent-open="${escapeAttribute(recent.id)}" title="Open ${escapeAttribute(recent.title)}">
             <strong>${escapeHtml(recent.title)}</strong>
             <span>${escapeHtml(recent.sourceName)}</span>
           </button>
@@ -2799,7 +3070,7 @@ function renderNodes() {
   const roots = new Set(analysis.roots.map((node) => node.id));
   const leaves = new Set(analysis.leaves.map((node) => node.id));
 
-  nodeLayer.innerHTML = nodes
+  nodeLayer.innerHTML = visibleNodes()
     .map((node) => {
       const incoming = incomingEdges(node.id).length;
       const outgoing = outgoingEdges(node.id).length;
@@ -2909,8 +3180,69 @@ function renderSelectionBox() {
   box.style.height = `${rect.bottom - rect.top}px`;
 }
 
+function renderGroups() {
+  groupLayer.innerHTML = groups
+    .map((group) => {
+      const bounds = groupBounds(group);
+
+      if (!bounds) {
+        return "";
+      }
+
+      const selected = group.id === selectedGroupId ? " selected" : "";
+      const hidden = group.hidden ? " hidden" : "";
+      const icon = group.hidden ? "eye-off" : "eye";
+      const title = group.hidden ? "Show group" : "Hide group";
+      const name = group.name.trim() || "Untitled group";
+      const color = groupColor(group);
+
+      return `
+        <section
+          class="group-box${selected}${hidden}"
+          data-group-id="${escapeAttribute(group.id)}"
+          style="left: ${bounds.left}px; top: ${bounds.top}px; width: ${bounds.right - bounds.left}px; height: ${bounds.bottom - bounds.top}px; --group-color: ${escapeAttribute(color)};"
+        >
+          <div class="group-header">
+            <span class="group-name" title="${escapeAttribute(name)}">${escapeHtml(name)}</span>
+            <button class="group-visibility" type="button" data-group-toggle="${escapeAttribute(group.id)}" title="${title}" aria-label="${title}">
+              <i data-lucide="${icon}"></i>
+            </button>
+          </div>
+        </section>
+      `;
+    })
+    .join("");
+
+  groupLayer.querySelectorAll<HTMLElement>(".group-box").forEach((element) => {
+    element.addEventListener("pointerdown", (event) => {
+      const groupId = element.dataset.groupId;
+
+      if (!groupId) {
+        return;
+      }
+
+      event.stopPropagation();
+      handleGroupPointerDown(event, groupId);
+    });
+  });
+
+  groupLayer.querySelectorAll<HTMLButtonElement>(".group-visibility").forEach((button) => {
+    button.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+    });
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const groupId = button.dataset.groupToggle;
+
+      if (groupId) {
+        toggleGroupHidden(groupId);
+      }
+    });
+  });
+}
+
 function renderEdges() {
-  const edgeMarkup = edges
+  const edgeMarkup = visibleEdges()
     .map((edge) => {
       const route = routeForEdge(edge);
 
@@ -3022,6 +3354,59 @@ function renderInspector() {
   const selectedNodes = nodes.filter((node) => selectedNodeIds.has(node.id));
   const selectedNode = selectedNodes.length === 1 ? selectedNodes[0] : null;
   const selectedEdge = selectedEdgeId ? edges.find((edge) => edge.id === selectedEdgeId) : null;
+  const selectedGroup = selectedGroupId ? groups.find((group) => group.id === selectedGroupId) : null;
+
+  if (selectedGroup) {
+    const selectedIds = new Set(selectedGroup.nodeIds);
+    const memberCount = selectedGroup.nodeIds.filter((nodeId) => getNode(nodeId)).length;
+    const incoming = edges.filter((edge) => !selectedIds.has(edge.from) && selectedIds.has(edge.to)).length;
+    const outgoing = edges.filter((edge) => selectedIds.has(edge.from) && !selectedIds.has(edge.to)).length;
+    const internal = edges.filter((edge) => selectedIds.has(edge.from) && selectedIds.has(edge.to)).length;
+    const visibilityIcon = selectedGroup.hidden ? "eye" : "eye-off";
+    const visibilityLabel = selectedGroup.hidden ? "Show Group" : "Hide Group";
+    const color = groupColor(selectedGroup);
+
+    inspector.innerHTML = `
+      <div class="field-group">
+        <label for="group-name">Group Name</label>
+        <input id="group-name" value="${escapeAttribute(selectedGroup.name)}" />
+      </div>
+      <div class="field-group">
+        <label for="group-color">Color</label>
+        <div class="color-control">
+          <input id="group-color" type="color" value="${escapeAttribute(color)}" />
+          <span id="group-color-value">${escapeHtml(color.toUpperCase())}</span>
+        </div>
+      </div>
+      <div class="relationship-list">
+        <h3>Contents</h3>
+        <p>${memberCount} nodes</p>
+        <h3>External Prerequisites</h3>
+        <p>${incoming}</p>
+        <h3>External Unlocks</h3>
+        <p>${outgoing}</p>
+        <h3>Internal Dependencies</h3>
+        <p>${internal}</p>
+      </div>
+      <div class="edge-layout-actions">
+        <button class="secondary-button icon-button" id="toggle-group-hidden" type="button" title="${visibilityLabel}">
+          <i data-lucide="${visibilityIcon}"></i>
+          <span>${visibilityLabel}</span>
+        </button>
+        <button class="secondary-button icon-button" id="ungroup-selection" type="button" title="Ungroup selected group">
+          <i data-lucide="ungroup"></i>
+          <span>Ungroup</span>
+        </button>
+      </div>
+      <button class="danger-button" id="delete-group" type="button" title="Delete group and contained nodes">
+        <i data-lucide="trash-2"></i>
+        <span>Delete Group Contents</span>
+      </button>
+    `;
+
+    bindGroupInspector(selectedGroup.id);
+    return;
+  }
 
   if (selectedNodes.length > 1) {
     const selectedIds = new Set(selectedNodes.map((node) => node.id));
@@ -3040,12 +3425,19 @@ function renderInspector() {
         <h3>Internal Dependencies</h3>
         <p>${internal}</p>
       </div>
-      <button class="danger-button" id="delete-selection" type="button">
+      <button class="secondary-button icon-button full-width-action" id="create-group" type="button" title="Create a group from selected nodes">
+        <i data-lucide="group"></i>
+        <span>Create Group</span>
+      </button>
+      <button class="danger-button" id="delete-selection" type="button" title="Delete selected nodes">
         <i data-lucide="trash-2"></i>
         <span>Delete Nodes</span>
       </button>
     `;
 
+    must<HTMLButtonElement>("#create-group").addEventListener("click", () => {
+      createGroupFromSelection();
+    });
     must<HTMLButtonElement>("#delete-selection").addEventListener("click", () => {
       deleteSelection();
     });
@@ -3097,7 +3489,7 @@ function renderInspector() {
         <h3>Safe narrative context</h3>
         <p>${escapeHtml(safeFacts.length > 0 ? safeFacts.join(", ") : "Only always-known facts are guaranteed.")}</p>
       </div>
-      <button class="danger-button" id="delete-selection" type="button">
+      <button class="danger-button" id="delete-selection" type="button" title="Delete selected node">
         <i data-lucide="trash-2"></i>
         <span>Delete Node</span>
       </button>
@@ -3109,11 +3501,11 @@ function renderInspector() {
 
   if (selectedEdge) {
     const routeReset = selectedEdge.manualRoute
-      ? `<button class="secondary-button" id="reset-edge-route" type="button">Reset Route</button>`
+      ? `<button class="secondary-button" id="reset-edge-route" type="button" title="Reset dependency route">Reset Route</button>`
       : "";
     const labelReset =
       typeof selectedEdge.manualLabelPosition === "number"
-        ? `<button class="secondary-button" id="reset-edge-label" type="button">Reset Label</button>`
+        ? `<button class="secondary-button" id="reset-edge-label" type="button" title="Reset dependency label position">Reset Label</button>`
         : "";
     const layoutActions =
       routeReset || labelReset ? `<div class="edge-layout-actions">${routeReset}${labelReset}</div>` : "";
@@ -3136,7 +3528,7 @@ function renderInspector() {
         <p>${escapeHtml(getNode(selectedEdge.to)?.title ?? selectedEdge.to)}</p>
       </div>
       ${layoutActions}
-      <button class="danger-button" id="delete-selection" type="button">
+      <button class="danger-button" id="delete-selection" type="button" title="Delete selected dependency">
         <i data-lucide="trash-2"></i>
         <span>Delete Edge</span>
       </button>
@@ -3244,6 +3636,38 @@ function bindEdgeInspector(edgeId: string) {
   });
 }
 
+function bindGroupInspector(groupId: string) {
+  const nameInput = must<HTMLInputElement>("#group-name");
+  const colorInput = must<HTMLInputElement>("#group-color");
+
+  bindGraphEditTransaction(nameInput);
+  bindGraphEditTransaction(colorInput);
+
+  nameInput.addEventListener("input", (event) => {
+    updateGroup(groupId, { name: (event.target as HTMLInputElement).value });
+    renderGroups();
+  });
+
+  colorInput.addEventListener("input", (event) => {
+    const color = sanitizeColor((event.target as HTMLInputElement).value);
+    updateGroup(groupId, { color });
+    must<HTMLSpanElement>("#group-color-value").textContent = color.toUpperCase();
+    renderGroups();
+  });
+
+  must<HTMLButtonElement>("#toggle-group-hidden").addEventListener("click", () => {
+    toggleGroupHidden(groupId);
+  });
+
+  must<HTMLButtonElement>("#ungroup-selection").addEventListener("click", () => {
+    ungroup(groupId);
+  });
+
+  must<HTMLButtonElement>("#delete-group").addEventListener("click", () => {
+    void deleteGroupWithConfirmation(groupId);
+  });
+}
+
 function bindGraphEditTransaction(element: HTMLElement) {
   element.addEventListener("focus", () => {
     beginGraphEdit();
@@ -3318,7 +3742,7 @@ function finishSelectionBox() {
 }
 
 function nodesInRect(rect: Rect) {
-  return nodes
+  return visibleNodes()
     .filter((node) =>
       rectsIntersect(rect, {
         left: node.x,
@@ -3341,6 +3765,109 @@ function rectFromPoints(start: Point, end: Point): Rect {
 
 function rectsIntersect(a: Rect, b: Rect) {
   return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
+
+function handleGroupPointerDown(event: PointerEvent, groupId: string) {
+  if (activeTool === "node") {
+    const point = getCanvasPoint(event.clientX, event.clientY);
+    const ghostPosition = nodeGhostPosition ?? positionNodeForPlacement(point.x - 105, point.y - 58);
+    addNodeAt(ghostPosition.x, ghostPosition.y);
+    return;
+  }
+
+  if (activeTool !== "select" || event.button !== 0) {
+    selectOnlyGroup(groupId);
+    render();
+    return;
+  }
+
+  const group = getGroup(groupId);
+  const bounds = group ? groupBounds(group) : null;
+
+  selectOnlyGroup(groupId);
+
+  if (!group || !bounds) {
+    render();
+    return;
+  }
+
+  const originPositions = group.nodeIds
+    .map((nodeId) => getNode(nodeId))
+    .filter((node): node is PuzzleNode => node !== undefined)
+    .map((node) => ({
+      nodeId: node.id,
+      x: node.x,
+      y: node.y,
+      width: node.width,
+      height: node.height,
+    }));
+
+  if (originPositions.length === 0) {
+    render();
+    return;
+  }
+
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  event.preventDefault();
+  beginGraphEdit();
+  groupDragState = {
+    groupId,
+    startPoint: point,
+    originBounds: bounds,
+    originPositions,
+    offsetX: point.x - bounds.left,
+    offsetY: point.y - bounds.top,
+  };
+
+  window.addEventListener("pointermove", handleGroupDragMove);
+  window.addEventListener("pointerup", finishGroupDrag, { once: true });
+  render();
+}
+
+function handleGroupDragMove(event: PointerEvent) {
+  if (!groupDragState) {
+    return;
+  }
+
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  const targetLeft = snapToGrid ? snapCoordinate(point.x - groupDragState.offsetX) : point.x - groupDragState.offsetX;
+  const targetTop = snapToGrid ? snapCoordinate(point.y - groupDragState.offsetY) : point.y - groupDragState.offsetY;
+  const desiredDelta = {
+    x: targetLeft - groupDragState.originBounds.left,
+    y: targetTop - groupDragState.originBounds.top,
+  };
+  const delta = clampGroupDragDelta(desiredDelta, groupDragState.originPositions);
+  const positionsByNodeId = new Map(
+    groupDragState.originPositions.map((position) => [
+      position.nodeId,
+      {
+        x: position.x + delta.x,
+        y: position.y + delta.y,
+      },
+    ]),
+  );
+
+  nodes = nodes.map((node) => {
+    const position = positionsByNodeId.get(node.id);
+
+    return position ? { ...node, ...position } : node;
+  });
+
+  if (groupDragState.originPositions.some((position) => isRoutedNode(position.nodeId))) {
+    markGraphvizRoutingDirty();
+    refreshGraphvizRoutingIfNeeded();
+  }
+
+  renderGroups();
+  renderEdges();
+  renderNodes();
+}
+
+function finishGroupDrag() {
+  groupDragState = null;
+  window.removeEventListener("pointermove", handleGroupDragMove);
+  render();
+  commitGraphEdit();
 }
 
 function beginEdgeRouteDrag(event: PointerEvent, edgeId: string) {
@@ -3474,8 +4001,8 @@ function finishEdgeLabelDrag() {
 function handleNodePointerDown(event: PointerEvent, nodeId: string) {
   if (activeTool === "connect") {
     if (!pendingConnectionFrom) {
-      pendingConnectionFrom = nodeId;
       selectOnlyNode(nodeId);
+      pendingConnectionFrom = nodeId;
       render();
       return;
     }
@@ -3573,6 +4100,7 @@ function handleDragMove(event: PointerEvent) {
     refreshGraphvizRoutingIfNeeded();
   }
 
+  renderGroups();
   renderEdges();
   renderNodes();
 }
@@ -3590,6 +4118,10 @@ function updateNode(nodeId: string, patch: Partial<PuzzleNode>) {
 
 function updateEdge(edgeId: string, patch: Partial<DependencyEdge>) {
   edges = edges.map((edge) => (edge.id === edgeId ? { ...edge, ...patch } : edge));
+}
+
+function updateGroup(groupId: string, patch: Partial<PuzzleGroup>) {
+  groups = groups.map((group) => (group.id === groupId ? { ...group, ...patch } : group));
 }
 
 function clearEdgeRouteOverride(edgeId: string) {
@@ -3620,10 +4152,54 @@ function getEdge(edgeId: string) {
   return edges.find((edge) => edge.id === edgeId);
 }
 
-function getRoutedNodeIds() {
+function getGroup(groupId: string) {
+  return groups.find((group) => group.id === groupId);
+}
+
+function visibleNodes() {
+  return nodes.filter((node) => !isNodeHidden(node.id));
+}
+
+function visibleEdges() {
+  return edges.filter((edge) => !isNodeHidden(edge.from) && !isNodeHidden(edge.to));
+}
+
+function isNodeHidden(nodeId: string) {
+  return groups.some((group) => group.hidden && group.nodeIds.includes(nodeId));
+}
+
+function groupBounds(group: PuzzleGroup): Rect | null {
+  const groupNodes = group.nodeIds
+    .map((nodeId) => getNode(nodeId))
+    .filter((node): node is PuzzleNode => node !== undefined);
+
+  if (groupNodes.length === 0) {
+    return null;
+  }
+
+  const left = Math.max(0, Math.min(...groupNodes.map((node) => node.x)) - GROUP_PADDING_X);
+  const top = Math.max(0, Math.min(...groupNodes.map((node) => node.y)) - GROUP_PADDING_TOP);
+  const right = Math.min(
+    world.width,
+    Math.max(left + 180, Math.max(...groupNodes.map((node) => node.x + node.width)) + GROUP_PADDING_X),
+  );
+  const bottom = Math.min(
+    world.height,
+    Math.max(top + 132, Math.max(...groupNodes.map((node) => node.y + node.height)) + GROUP_PADDING_BOTTOM),
+  );
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+  };
+}
+
+function getRoutedNodeIds(routeEdges = edges) {
   const routedNodeIds = new Set<string>();
 
-  edges.forEach((edge) => {
+  routeEdges.forEach((edge) => {
     routedNodeIds.add(edge.from);
     routedNodeIds.add(edge.to);
   });
@@ -3751,7 +4327,8 @@ function buildGraphvizDot(mode: "auto" | "fixed") {
         ]
       : [`splines="ortho"`, `outputorder="edgesfirst"`, `pad="0.35"`, `margin="0"`];
 
-  const routedNodeIds = mode === "fixed" ? getRoutedNodeIds() : new Set(nodes.map((node) => node.id));
+  const graphvizEdges = mode === "fixed" ? visibleEdges() : edges;
+  const routedNodeIds = mode === "fixed" ? getRoutedNodeIds(graphvizEdges) : new Set(nodes.map((node) => node.id));
   const graphvizNodes = nodes.filter((node) => routedNodeIds.has(node.id));
   const nodeLines = graphvizNodes
     .map((node) => {
@@ -3772,7 +4349,7 @@ function buildGraphvizDot(mode: "auto" | "fixed") {
     })
     .join("\n");
 
-  const edgeLines = edges
+  const edgeLines = graphvizEdges
     .map((edge) => {
       const attrs = [
         `edgeId=${dotId(edge.id)}`,
@@ -4582,6 +5159,11 @@ function normalizeGraphDocument(value: unknown): GraphDocumentV1 {
   const normalizedEdges = record.edges
     .map((edge) => normalizeGraphEdge(edge))
     .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
+  const normalizedGroups = Array.isArray(record.groups)
+    ? record.groups
+        .map((group) => normalizeGraphGroup(group, nodeIds))
+        .filter((group) => group.nodeIds.length > 0)
+    : [];
   const worldRecord = isRecord(record.world) ? record.world : {};
 
   return {
@@ -4595,6 +5177,7 @@ function normalizeGraphDocument(value: unknown): GraphDocumentV1 {
     },
     nodes: normalizedNodes,
     edges: normalizedEdges,
+    groups: normalizedGroups,
   };
 }
 
@@ -4655,6 +5238,26 @@ function normalizeGraphEdge(value: unknown): DependencyEdge {
   }
 
   return edge;
+}
+
+function normalizeGraphGroup(value: unknown, knownNodeIds: Set<string>): PuzzleGroup {
+  const record = asRecord(value, "Graph group must be an object.");
+  const id = stringValue(record.id, "");
+
+  if (!id) {
+    throw new Error("Graph group is missing an id.");
+  }
+
+  const rawNodeIds = Array.isArray(record.nodeIds) ? record.nodeIds : [];
+  const nodeIds = [...new Set(rawNodeIds.map((nodeId) => stringValue(nodeId, "")).filter((nodeId) => knownNodeIds.has(nodeId)))];
+
+  return {
+    id,
+    name: stringValue(record.name, "Untitled group"),
+    color: sanitizeColor(stringValue(record.color, defaultGroupColor(1))),
+    nodeIds,
+    hidden: record.hidden === true,
+  };
 }
 
 function rememberGraph(document: GraphDocumentV1, sourceName: string, filePath?: string) {
@@ -4825,6 +5428,13 @@ function cloneEdge(edge: DependencyEdge): DependencyEdge {
   };
 }
 
+function cloneGroup(group: PuzzleGroup): PuzzleGroup {
+  return {
+    ...group,
+    nodeIds: [...group.nodeIds],
+  };
+}
+
 function clearEdgeLayoutOverrides(edge: DependencyEdge): DependencyEdge {
   const next = { ...edge };
   delete next.manualRoute;
@@ -4948,8 +5558,18 @@ function defaultNodeColor(kind: NodeKind, act = "") {
   return colors[kind];
 }
 
+function defaultGroupColor(serial = 1) {
+  const colors = ["#006a6a", "#6c5d8f", "#8c5a00", "#7a4d7c", "#2f6b3f", "#8a4b3e"];
+
+  return colors[(Math.max(1, serial) - 1) % colors.length];
+}
+
 function nodeColor(node: PuzzleNode) {
   return sanitizeColor(node.color || defaultNodeColor(node.kind, node.act));
+}
+
+function groupColor(group: PuzzleGroup) {
+  return sanitizeColor(group.color || defaultGroupColor(1));
 }
 
 function sanitizeColor(value: string) {
@@ -5034,9 +5654,12 @@ function hydrateIcons() {
     icons: {
       Activity,
       Download,
+      Eye,
+      EyeOff,
       FilePlus2,
       FolderOpen,
       GitBranchPlus,
+      Group: GroupIcon,
       History,
       House,
       Layers3,
@@ -5052,6 +5675,7 @@ function hydrateIcons() {
       Trash2,
       TriangleAlert,
       Undo2,
+      Ungroup,
       Workflow,
       ZoomIn,
       ZoomOut,
