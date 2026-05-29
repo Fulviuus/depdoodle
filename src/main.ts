@@ -354,6 +354,7 @@ let graphviz: Graphviz | null = null;
 let graphvizLayout: GraphvizLayout | null = null;
 let graphvizError: string | null = null;
 let graphvizRoutingDirty = true;
+let routingRefreshHandle: number | null = null;
 let nodeGhostPosition: Point | null = null;
 let edgeLabelMeasureContext: CanvasRenderingContext2D | null = null;
 let zoom = 1;
@@ -970,6 +971,7 @@ function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
   selectionBoxState = null;
   edgeRouteDragState = null;
   edgeLabelDragState = null;
+  cancelScheduledRoutingRefresh();
   renderSelectionBox();
   syncPrimarySelection();
   if (selectedGroupId && !groups.some((group) => group.id === selectedGroupId)) {
@@ -1418,10 +1420,10 @@ function measureExportBounds(): ExportBounds {
     };
   }
 
-  const left = Math.max(0, Math.floor(Math.min(...xs) - EXPORT_PADDING));
-  const top = Math.max(0, Math.floor(Math.min(...ys) - EXPORT_PADDING));
-  const right = Math.ceil(Math.max(...xs) + EXPORT_PADDING);
-  const bottom = Math.ceil(Math.max(...ys) + EXPORT_PADDING);
+  const left = Math.max(0, Math.floor(minOf(xs, 0) - EXPORT_PADDING));
+  const top = Math.max(0, Math.floor(minOf(ys, 0) - EXPORT_PADDING));
+  const right = Math.ceil(maxOf(xs, 0) + EXPORT_PADDING);
+  const bottom = Math.ceil(maxOf(ys, 0) + EXPORT_PADDING);
 
   return {
     left,
@@ -3055,7 +3057,7 @@ function render() {
   renderToolbar();
   renderGroups();
   renderEdges();
-  renderNodes();
+  renderNodes(analysis);
   renderSelectionBox();
   renderMetrics(analysis);
   renderWidthBars(analysis);
@@ -3153,8 +3155,7 @@ function renderToolbar() {
   autoLayoutButton.title = "Rearrange nodes by dependency layers";
 }
 
-function renderNodes() {
-  const analysis = analyzeGraph();
+function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
   const roots = new Set(analysis.roots.map((node) => node.id));
   const leaves = new Set(analysis.leaves.map((node) => node.id));
 
@@ -3454,7 +3455,7 @@ function renderPacingView(analysis: GraphAnalysis) {
   const bars = buildPacingBars(analysis, lanes, layerCount);
   const barsByLane = new Map(lanes.map((lane) => [lane.id, bars.filter((bar) => bar.laneId === lane.id)]));
   const layerWidths = Array.from({ length: layerCount }, (_, index) => analysis.topology.layers[index]?.length ?? 0);
-  const widestLayerWidth = Math.max(...layerWidths);
+  const widestLayerWidth = maxOf(layerWidths, 0);
   const widestLayer = layerWidths.indexOf(widestLayerWidth);
   const criticalPath = criticalPathForAnalysis(analysis);
   const nonRewardLeaves = analysis.leaves.filter((node) => node.kind !== "reward");
@@ -3642,7 +3643,7 @@ function buildPacingBars(analysis: GraphAnalysis, lanes: PacingLane[], layerCoun
 }
 
 function laneStartLayer(lane: PacingLane, analysis: GraphAnalysis) {
-  return Math.min(...lane.nodes.map((node) => analysis.topology.layerByNode.get(node.id) ?? 0));
+  return minOf(lane.nodes.map((node) => analysis.topology.layerByNode.get(node.id) ?? 0), 0);
 }
 
 function designRoleForNode(node: PuzzleNode, analysis: GraphAnalysis) {
@@ -4049,7 +4050,8 @@ function bindNodeInspector(nodeId: string) {
 
   difficultyInput.addEventListener("input", (event) => {
     const value = (event.target as HTMLInputElement).value.trim();
-    const difficulty = value === "" ? undefined : clamp(Number(value), 1, 5);
+    const parsed = Number(value);
+    const difficulty = value === "" || !Number.isFinite(parsed) ? undefined : clamp(parsed, 1, 5);
     updateNode(nodeId, { difficulty });
     renderNodes();
   });
@@ -4322,18 +4324,19 @@ function handleGroupDragMove(event: PointerEvent) {
     return position ? { ...node, ...position } : node;
   });
 
-  if (groupDragState.originPositions.some((position) => isRoutedNode(position.nodeId))) {
-    markGraphvizRoutingDirty();
-    refreshGraphvizRoutingIfNeeded();
-  }
-
   renderGroups();
-  renderEdges();
   renderNodes();
+
+  if (groupDragState.originPositions.some((position) => isRoutedNode(position.nodeId))) {
+    scheduleRoutingRefresh();
+  } else {
+    renderEdges();
+  }
 }
 
 function finishGroupDrag() {
   groupDragState = null;
+  cancelScheduledRoutingRefresh();
   window.removeEventListener("pointermove", handleGroupDragMove);
   render();
   commitGraphEdit();
@@ -4564,18 +4567,19 @@ function handleDragMove(event: PointerEvent) {
     return position ? { ...node, ...position } : node;
   });
 
-  if (dragState.nodeIds.some(isRoutedNode)) {
-    markGraphvizRoutingDirty();
-    refreshGraphvizRoutingIfNeeded();
-  }
-
   renderGroups();
-  renderEdges();
   renderNodes();
+
+  if (dragState.nodeIds.some(isRoutedNode)) {
+    scheduleRoutingRefresh();
+  } else {
+    renderEdges();
+  }
 }
 
 function finishDrag() {
   dragState = null;
+  cancelScheduledRoutingRefresh();
   window.removeEventListener("pointermove", handleDragMove);
   render();
   commitGraphEdit();
@@ -4660,15 +4664,15 @@ function groupBounds(group: PuzzleGroup): Rect | null {
     return null;
   }
 
-  const left = Math.max(0, Math.min(...groupNodes.map((node) => node.x)) - GROUP_PADDING_X);
-  const top = Math.max(0, Math.min(...groupNodes.map((node) => node.y)) - GROUP_PADDING_TOP);
+  const left = Math.max(0, minOf(groupNodes.map((node) => node.x), 0) - GROUP_PADDING_X);
+  const top = Math.max(0, minOf(groupNodes.map((node) => node.y), 0) - GROUP_PADDING_TOP);
   const right = Math.min(
     world.width,
-    Math.max(left + 180, Math.max(...groupNodes.map((node) => node.x + node.width)) + GROUP_PADDING_X),
+    Math.max(left + 180, maxOf(groupNodes.map((node) => node.x + node.width), left) + GROUP_PADDING_X),
   );
   const bottom = Math.min(
     world.height,
-    Math.max(top + 132, Math.max(...groupNodes.map((node) => node.y + node.height)) + GROUP_PADDING_BOTTOM),
+    Math.max(top + 132, maxOf(groupNodes.map((node) => node.y + node.height), top) + GROUP_PADDING_BOTTOM),
   );
 
   return {
@@ -4736,6 +4740,32 @@ function refreshGraphvizRouting() {
   }
 }
 
+// During a drag we get a pointermove per frame (or faster). Re-running the
+// Graphviz WASM layout synchronously on each one is the dominant cost, so we
+// coalesce it to at most one layout per animation frame and re-render the edges
+// once it lands. Nodes/edges are repainted immediately by the caller so the drag
+// still feels live; only the orthogonal re-routing is deferred.
+function scheduleRoutingRefresh() {
+  markGraphvizRoutingDirty();
+
+  if (routingRefreshHandle !== null) {
+    return;
+  }
+
+  routingRefreshHandle = window.requestAnimationFrame(() => {
+    routingRefreshHandle = null;
+    refreshGraphvizRoutingIfNeeded();
+    renderEdges();
+  });
+}
+
+function cancelScheduledRoutingRefresh() {
+  if (routingRefreshHandle !== null) {
+    window.cancelAnimationFrame(routingRefreshHandle);
+    routingRefreshHandle = null;
+  }
+}
+
 function measureEdgeLabel(label: string) {
   if (!edgeLabelMeasureContext) {
     edgeLabelMeasureContext = document.createElement("canvas").getContext("2d");
@@ -4761,7 +4791,7 @@ function widestEdgeLabelWidth() {
     return EDGE_LABEL_MIN_WIDTH;
   }
 
-  return Math.max(...edges.map((edge) => measureEdgeLabel(edge.label).width));
+  return maxOf(edges.map((edge) => measureEdgeLabel(edge.label).width), EDGE_LABEL_MIN_WIDTH);
 }
 
 function computeGraphvizLayout(mode: "auto" | "fixed"): GraphvizLayout {
@@ -5205,8 +5235,8 @@ function measureWorldSize(
   });
 
   return {
-    width: Math.ceil(Math.max(...xs)),
-    height: Math.ceil(Math.max(...ys)),
+    width: Math.ceil(maxOf(xs, EMPTY_GRAPH_WORLD.width)),
+    height: Math.ceil(maxOf(ys, EMPTY_GRAPH_WORLD.height)),
   };
 }
 
@@ -5350,7 +5380,7 @@ function nearestPointDistance(point: Point, candidates: Point[]) {
     return Number.POSITIVE_INFINITY;
   }
 
-  return Math.min(...candidates.map((candidate) => distanceBetween(point, candidate)));
+  return minOf(candidates.map((candidate) => distanceBetween(point, candidate)), Number.POSITIVE_INFINITY);
 }
 
 function orthogonalPath(points: Point[]) {
@@ -5443,22 +5473,24 @@ function getTopology(): Topology {
 
   edges.forEach((edge) => {
     inDegree.set(edge.to, (inDegree.get(edge.to) ?? 0) + 1);
-    children.set(edge.from, [...(children.get(edge.from) ?? []), edge.to]);
+    children.get(edge.from)?.push(edge.to);
   });
 
+  // Kahn's algorithm, always emitting the position-smallest currently-available
+  // node. We walk the queue with a head index instead of shift() (no O(N) splice
+  // per step) and only re-sort the unprocessed tail when new nodes become ready,
+  // which preserves the exact ordering the renderer relied on.
   const queue = nodes
     .filter((node) => (inDegree.get(node.id) ?? 0) === 0)
     .sort(compareNodesByPosition);
   const order: PuzzleNode[] = [];
+  let head = 0;
 
-  while (queue.length > 0) {
-    const node = queue.shift();
-
-    if (!node) {
-      continue;
-    }
-
+  while (head < queue.length) {
+    const node = queue[head];
+    head += 1;
     order.push(node);
+    let addedReadyNode = false;
 
     for (const childId of children.get(node.id) ?? []) {
       const nextDegree = (inDegree.get(childId) ?? 0) - 1;
@@ -5469,8 +5501,16 @@ function getTopology(): Topology {
 
         if (child) {
           queue.push(child);
-          queue.sort(compareNodesByPosition);
+          addedReadyNode = true;
         }
+      }
+    }
+
+    if (addedReadyNode && head < queue.length) {
+      const tail = queue.slice(head).sort(compareNodesByPosition);
+
+      for (let index = 0; index < tail.length; index += 1) {
+        queue[head + index] = tail[index];
       }
     }
   }
@@ -5483,7 +5523,7 @@ function getTopology(): Topology {
     const parentLayers = incomingEdges(node.id)
       .map((edge) => layerByNode.get(edge.from))
       .filter((layer): layer is number => typeof layer === "number");
-    const layer = parentLayers.length === 0 ? 0 : Math.max(...parentLayers) + 1;
+    const layer = parentLayers.length === 0 ? 0 : maxOf(parentLayers, 0) + 1;
     layerByNode.set(node.id, layer);
   });
 
@@ -5532,16 +5572,69 @@ function getAncestors(nodeId: string) {
   return result.sort(compareNodesByPosition);
 }
 
+// Graph lookups are memoized on the identity of the `nodes`/`edges` arrays.
+// Every mutation in this module replaces those arrays wholesale (never edits in
+// place), so an identity check is enough to know the cache is still valid. This
+// turns getNode/incoming/outgoing from O(N)/O(E) scans into O(1) map lookups,
+// which matters because they are called inside per-node render and analysis loops.
+const EMPTY_EDGES: readonly DependencyEdge[] = Object.freeze([]);
+
+let nodeIndexSource: PuzzleNode[] | null = null;
+let nodeIndexValue = new Map<string, PuzzleNode>();
+let edgeAdjacencySource: DependencyEdge[] | null = null;
+let incomingEdgeMap = new Map<string, DependencyEdge[]>();
+let outgoingEdgeMap = new Map<string, DependencyEdge[]>();
+
+function nodeIndex() {
+  if (nodeIndexSource !== nodes) {
+    nodeIndexValue = new Map(nodes.map((node) => [node.id, node]));
+    nodeIndexSource = nodes;
+  }
+
+  return nodeIndexValue;
+}
+
+function ensureEdgeAdjacency() {
+  if (edgeAdjacencySource === edges) {
+    return;
+  }
+
+  incomingEdgeMap = new Map();
+  outgoingEdgeMap = new Map();
+
+  for (const edge of edges) {
+    const outgoing = outgoingEdgeMap.get(edge.from);
+    if (outgoing) {
+      outgoing.push(edge);
+    } else {
+      outgoingEdgeMap.set(edge.from, [edge]);
+    }
+
+    const incoming = incomingEdgeMap.get(edge.to);
+    if (incoming) {
+      incoming.push(edge);
+    } else {
+      incomingEdgeMap.set(edge.to, [edge]);
+    }
+  }
+
+  edgeAdjacencySource = edges;
+}
+
 function getNode(nodeId: string) {
-  return nodes.find((node) => node.id === nodeId);
+  return nodeIndex().get(nodeId);
 }
 
-function incomingEdges(nodeId: string) {
-  return edges.filter((edge) => edge.to === nodeId);
+// The returned arrays are shared cache entries; callers treat them as read-only
+// (verified: no caller mutates the result in place — they map/filter/reduce).
+function incomingEdges(nodeId: string): readonly DependencyEdge[] {
+  ensureEdgeAdjacency();
+  return incomingEdgeMap.get(nodeId) ?? EMPTY_EDGES;
 }
 
-function outgoingEdges(nodeId: string) {
-  return edges.filter((edge) => edge.from === nodeId);
+function outgoingEdges(nodeId: string): readonly DependencyEdge[] {
+  ensureEdgeAdjacency();
+  return outgoingEdgeMap.get(nodeId) ?? EMPTY_EDGES;
 }
 
 function getCanvasPoint(clientX: number, clientY: number) {
@@ -5593,13 +5686,15 @@ function clampGroupDragDelta(
     return delta;
   }
 
-  const minDeltaX = Math.max(...positions.map((position) => 30 - position.x));
-  const maxDeltaX = Math.min(
-    ...positions.map((position) => world.width - Math.max(250, position.width + 40) - position.x),
+  const minDeltaX = maxOf(positions.map((position) => 30 - position.x), Number.NEGATIVE_INFINITY);
+  const maxDeltaX = minOf(
+    positions.map((position) => world.width - Math.max(250, position.width + 40) - position.x),
+    Number.POSITIVE_INFINITY,
   );
-  const minDeltaY = Math.max(...positions.map((position) => 42 - position.y));
-  const maxDeltaY = Math.min(
-    ...positions.map((position) => world.height - Math.max(150, position.height + 32) - position.y),
+  const minDeltaY = maxOf(positions.map((position) => 42 - position.y), Number.NEGATIVE_INFINITY);
+  const maxDeltaY = minOf(
+    positions.map((position) => world.height - Math.max(150, position.height + 32) - position.y),
+    Number.POSITIVE_INFINITY,
   );
 
   return {
@@ -5945,7 +6040,7 @@ function slugify(value: string) {
 
 function rememberGraph(document: GraphDocumentV1, sourceName: string, filePath?: string) {
   const openedAt = new Date().toISOString();
-  const id = recentGraphId(document.title, filePath ?? sourceName);
+  const id = recentGraphId(document.title, sourceName, filePath);
   recentGraphs = [
     {
       id,
@@ -6005,7 +6100,7 @@ function loadRecentGraphs(): RecentGraph[] {
           }
 
           const recent: RecentGraph = {
-            id: stringValue(value.id, recentGraphId(title, filePath ?? sourceName)),
+            id: stringValue(value.id, recentGraphId(title, sourceName, filePath)),
             title,
             sourceName,
             openedAt: stringValue(value.openedAt, ""),
@@ -6093,10 +6188,18 @@ function applyTheme(nextTheme: ThemeMode) {
 }
 
 function saveRecentGraphs() {
-  try {
-    localStorage.setItem(RECENT_GRAPHS_STORAGE_KEY, JSON.stringify(recentGraphs));
-  } catch {
-    // Recent files are a convenience; the graph should still open if storage is unavailable.
+  // Each entry embeds a full graph document, so a few large graphs can blow the
+  // ~5MB localStorage quota. Rather than dropping the whole list on a quota
+  // error, retry with progressively fewer (most-recent-first) entries so the
+  // newest graphs still persist.
+  for (let limit = recentGraphs.length; limit >= 0; limit -= 1) {
+    try {
+      localStorage.setItem(RECENT_GRAPHS_STORAGE_KEY, JSON.stringify(recentGraphs.slice(0, limit)));
+      return;
+    } catch {
+      // Try again with one fewer entry; if even an empty list fails, storage is
+      // unavailable and recents are simply not persisted this session.
+    }
   }
 }
 
@@ -6126,14 +6229,18 @@ function clearEdgeLayoutOverrides(edge: DependencyEdge): DependencyEdge {
   return next;
 }
 
-function recentGraphId(title: string, sourceName: string) {
-  return `${sourceName}::${title}`.toLowerCase();
+// When a file path is known it is the stable identity for a recent entry, so
+// editing the chart title (or re-saving) updates the existing entry instead of
+// spawning a duplicate. Only fall back to source-name + title when there is no
+// path (e.g. browser downloads).
+function recentGraphId(title: string, sourceName: string, filePath?: string) {
+  return (filePath && filePath.trim() ? filePath : `${sourceName}::${title}`).toLowerCase();
 }
 
 function measureGraphBounds(graphNodes: PuzzleNode[]) {
   return {
-    width: Math.ceil(Math.max(...graphNodes.map((node) => node.x + node.width + 220), EMPTY_GRAPH_WORLD.width)),
-    height: Math.ceil(Math.max(...graphNodes.map((node) => node.y + node.height + 220), EMPTY_GRAPH_WORLD.height)),
+    width: Math.ceil(maxOf(graphNodes.map((node) => node.x + node.width + 220), EMPTY_GRAPH_WORLD.width)),
+    height: Math.ceil(maxOf(graphNodes.map((node) => node.y + node.height + 220), EMPTY_GRAPH_WORLD.height)),
   };
 }
 
@@ -6293,6 +6400,43 @@ function compareNodesByPosition(a: PuzzleNode, b: PuzzleNode) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+// Reduce-based min/max. Spreading a large array into Math.min/Math.max
+// (`Math.max(...points)`) throws a RangeError once the argument count gets big,
+// so these are used on any array whose length scales with the graph size. The
+// fallback is returned only for an empty array; otherwise the accumulator is
+// seeded from the first element so a real extremum is always found.
+function maxOf(values: number[], fallback: number) {
+  if (values.length === 0) {
+    return fallback;
+  }
+
+  let result = values[0];
+
+  for (let index = 1; index < values.length; index += 1) {
+    if (values[index] > result) {
+      result = values[index];
+    }
+  }
+
+  return result;
+}
+
+function minOf(values: number[], fallback: number) {
+  if (values.length === 0) {
+    return fallback;
+  }
+
+  let result = values[0];
+
+  for (let index = 1; index < values.length; index += 1) {
+    if (values[index] < result) {
+      result = values[index];
+    }
+  }
+
+  return result;
 }
 
 function round(value: number) {
