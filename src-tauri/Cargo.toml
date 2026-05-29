@@ -1,6 +1,6 @@
 [package]
 name = "depdoodle"
-version = "0.1.1"
+version = "0.1.2"
 description = "A puzzle dependency chart editor"
 authors = ["Fulvio"]
 edition = "2021"
