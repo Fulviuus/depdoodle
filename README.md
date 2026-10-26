@@ -332,33 +332,6 @@ Important paths:
 - [PUZZLE_DEPENDENCY_CHART.md](PUZZLE_DEPENDENCY_CHART.md): puzzle dependency
   chart design memo.
 
-## Brand Assets
-
-The logo uses the original wordmark with three dependency nodes overlaid on its
-first D. The standalone marks and app icons use that same letterform and node
-placement. SVGs contain outlined lettering and do not need installed fonts.
-
-![DepDoodle logo and icons in light and dark variants](docs/brand/identity-preview.png)
-
-| Asset | Light variant | Dark variant |
-| --- | --- | --- |
-| Logo, transparent background | [SVG](public/depdoodle-logo.svg) · [PNG](public/depdoodle-logo.png) | [SVG](public/depdoodle-logo-dark.svg) · [PNG](public/depdoodle-logo-dark.png) |
-| Mark, transparent background | [SVG](public/depdoodle-mark.svg) · [PNG](public/depdoodle-mark.png) | [SVG](public/depdoodle-mark-dark.svg) · [PNG](public/depdoodle-mark-dark.png) |
-| App icon, rounded tile | [SVG](public/depdoodle-icon-light.svg) · [PNG](public/depdoodle-icon-light.png) | [SVG](public/depdoodle-icon.svg) · [PNG](public/depdoodle-icon.png) |
-
-The light logo and mark use teal lettering for light surfaces; the dark versions
-use cream lettering for dark surfaces. Logo PNGs are 1200 × 304 pixels; marks and
-app-icon PNGs are 1024 × 1024 pixels.
-
-The README and welcome screen select the matching logo for their theme. Desktop
-builds use the dark app icon, including the [macOS ICNS](src-tauri/icons/icon.icns)
-and [Windows ICO](src-tauri/icons/icon.ico). Regenerate all platform icons from
-the vector source with:
-
-```bash
-npm run tauri -- icon public/depdoodle-icon.svg --output src-tauri/icons --ios-color '#123D3C'
-```
-
 ## Releases
 
 Release builds are published on
