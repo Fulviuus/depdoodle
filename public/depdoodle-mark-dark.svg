@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none" role="img" aria-labelledby="depdoodle-mark-dark-title">
+  <title id="depdoodle-mark-dark-title">DepDoodle</title>
+  <!-- Exact first-letter contours and circles from the approved wordmark. -->
+  <defs>
+    <mask id="depdoodle-mark-dark-cutouts" maskUnits="userSpaceOnUse" x="-10" y="-90" width="110" height="125">
+      <rect x="-10" y="-90" width="110" height="125" fill="white"/>
+      <circle cx="65.25" cy="-35.4" r="7.25" fill="black"/>
+      <circle cx="14.1" cy="-5.5" r="7.25" fill="black"/>
+    </mask>
+  </defs>
+  <g transform="translate(43.889 203.554) scale(2.12)">
+    <path d="M7.800 -70.800L32.900 -70.800Q39.800 -70.800 46.800 -69.000Q53.800 -67.200 59.400 -63.050Q65.000 -58.900 68.500 -52.150Q72.000 -45.400 72.000 -35.400Q72.000 -26.100 68.500 -19.400Q65.000 -12.700 59.400 -8.400Q53.800 -4.100 46.800 -2.050Q39.800 -0.000 32.900 -0.000L7.800 -0.000ZM30.900 -11.000Q35.800 -11.000 40.700 -12.150Q45.600 -13.300 49.550 -16.050Q53.500 -18.800 56.000 -23.500Q58.500 -28.200 58.500 -35.400Q58.500 -43.000 56.000 -47.800Q53.500 -52.600 49.550 -55.300Q45.600 -58.000 40.700 -59.000Q35.800 -60.000 30.900 -60.000L20.400 -60.000L20.400 -11.000Z" fill="#F8F5ED" mask="url(#depdoodle-mark-dark-cutouts)"/>
+    <g fill="none" stroke="#F8F5ED" stroke-width="4.5">
+      <circle cx="65.25" cy="-35.4" r="9.5"/>
+      <circle cx="14.1" cy="-5.5" r="9.5"/>
+    </g>
+    <circle cx="14.1" cy="-65.4" r="11.75" fill="#F48668"/>
+  </g>
+</svg>

@@ -2,12 +2,17 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "dialog:default",
     "fs:default",
     "fs:write-files",
-    "opener:default"
+    "opener:default",
+    "fs:read-files",
+    "core:window:allow-close",
+    "core:window:allow-destroy"
   ]
 }

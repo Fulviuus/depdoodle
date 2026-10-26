@@ -1,7 +1,11 @@
 # DepDoodle
 
 <p align="center">
-  <img src="public/depdoodle-logo.png" alt="DepDoodle" width="560" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="public/depdoodle-logo-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="public/depdoodle-logo.svg" />
+    <img src="public/depdoodle-logo.svg" alt="DepDoodle" width="560" />
+  </picture>
 </p>
 
 DepDoodle is a Tauri desktop editor for puzzle dependency charts. It is built
@@ -11,8 +15,24 @@ and which narrative assumptions are safe.
 
 The app aims for an OmniGraffle-like charting surface, but with puzzle-chart
 semantics built in: dependency tokens, puzzle/gate/reward nodes, structural
-checks, visible groups, Graphviz-assisted routing, and a pacing view generated
+checks, visible groups, D2/TALA routing, and a pacing view generated
 from the dependency graph.
+
+[Download the latest release](https://github.com/Fulviuus/depdoodle/releases/latest)
+for Windows, macOS, or Linux.
+
+## New in 0.2.0
+
+- D2/TALA replaces Graphviz for connection routing and confirmed automatic layout.
+  Connections update as boxes move; existing box positions stay under your control.
+- Checks can be selected together, with glowing matches and the rest of the chart
+  faded to 20% opacity.
+- Interactive playthrough adds Solve/Undo controls, completion crosses, and
+  animated connections to the next available puzzles.
+- AND/OR prerequisites, narrative checks, search, and prerequisite/unlock focus
+  help inspect the structure of larger charts.
+- More reliable saving, recovery, recent files, and closing protect editing work.
+- Refreshed logos and application icons support light and dark themes.
 
 ## Screenshots
 
@@ -68,18 +88,38 @@ The longer design memo lives in
 - **Pacing tab**: a Gantt-like availability view generated from dependency
   layers, with groups as lanes.
 - **Structural checks**: cycles, missing roots, non-reward leaves, over-wide
-  layers, missing closers, and routing errors.
+  layers, missing closers, and routing errors. Toggle multiple checks to glow
+  their matching elements and fade the rest to 20% opacity; deselect them to
+  restore the normal chart.
 - **Branch width chart**: quick view of how many nodes sit in each dependency
   layer.
-- **Auto Layout**: Graphviz-backed layout by dependency layer, with a
-  confirmation prompt before rearranging nodes.
-- **Routing**: Graphviz-assisted orthogonal path routing, with manual connector
-  and label adjustments when needed.
+- **Auto Layout**: D2/TALA automatic box layout, with explicit
+  confirmation before moving nodes and replacing connector routes and labels.
+- **Routing**: automatic D2/TALA connection routing on load and after
+  graph edits, including live previews while dragging boxes. The preview and
+  release use the same router; manual connector and label overrides are preserved.
+  Routing keeps every node at its saved position. Inspecting checks or switching views does not
+  rearrange boxes or recalculate connection routes.
 - **Zoom controls**: zoom in, zoom out, reset, and fit chart to view.
 - **Snap to grid**: optional grid snapping for node and group movement.
 - **Multiple selection**: box-select or modifier-select nodes, then drag or
   group them.
 - **Undo/redo**: multi-step history for graph edits.
+- **Search and checks**: jump to and highlight matching puzzles without hiding
+  the rest of the chart or changing its zoom and layout.
+- **Explicit focus**: use Focus prerequisites or Focus unlocks to isolate a
+  subgraph. A visible banner identifies the focused view and restores the entire
+  graph with one click.
+- **Playthrough simulation**: solve puzzles directly on the chart. Completed
+  puzzles get an X, moving dashes lead to accessible next steps, and locked
+  puzzles and connections fade to 20% opacity. Undo completion or reset the
+  playthrough without editing the chart.
+- **Prerequisite rules**: require all incoming dependencies (AND, the default),
+  or any incoming dependency (OR) for alternative solutions.
+- **Narrative references**: tag events assumed by a puzzle's writing. Checks flag
+  missing references and events that are not guaranteed by its prerequisites.
+- **Recovery drafts**: edits are saved locally for recovery, with explicit
+  Save/Discard/Cancel prompts before leaving an edited graph.
 - **Themes**: light and dark mode.
 - **Save**: writes a `.depdoodle` project file.
 - **Export**: PNG, JPG, PDF, and SVG.
@@ -92,8 +132,16 @@ The welcome screen is the project entry point. It shows the product logo,
 creates new graphs, loads existing `.depdoodle` files, and lists recent files.
 Recent items can be removed individually or cleared as a group.
 
-Recent files are a convenience stored in local browser/app storage. They are not
-the source of truth. Save important work as a `.depdoodle` file.
+Recent entries are stored locally. In the desktop app, reopening a recent file
+reads its current contents from disk. If access has expired or the file moved,
+locate the file again. Browser-only recents retain a snapshot because browsers do
+not provide persistent filesystem access.
+
+Save important work as a `.depdoodle` file. Unsaved edits also create a local
+recovery draft; after an interrupted session, choose **Recover unsaved draft** on
+the welcome screen. A successful save or explicit discard clears that draft.
+Recovery depends on local storage being available and is not a backup of the
+project file.
 
 ### Chart
 
@@ -104,6 +152,13 @@ The Chart tab is the editable dependency canvas. It contains:
 - right inspector
 - toolbar for save, export, undo, redo, tools, layout, snap, zoom, fit, and
   theme
+
+Connection routing runs automatically, including for older files that do not
+store bend points. While dragging, connections follow the boxes and D2 refines
+their routes in the background; releasing keeps the latest route for the final
+position. **Auto Layout** is the only operation that
+rearranges boxes, and it always requires explicit confirmation. Saved manual
+connection and label overrides take precedence over automatic routing.
 
 Use **Node** to place puzzle nodes. Use **Connect** to click one node and then
 another, creating a dependency. Use **Select** to move nodes, select groups, drag
@@ -119,9 +174,30 @@ The Pacing tab turns the dependency graph into an availability timeline:
   work
 - closers, critical path length, loose leaves, and broad layers are summarized
 
+Puzzles with an OR prerequisite use their earliest alternative dependency layer.
+Their safe narrative context contains only ancestors shared by every alternative.
+Cycles remain visible as structural warnings; the critical path is suppressed
+until the cycle is resolved.
+
 This is deliberately not a calendar Gantt chart. It does not guess real time or
 task duration. It is a puzzle-availability chart: useful for spotting linear
 stretches, over-broad layers, act gates, and pacing pressure.
+
+### Checks and Playthrough
+
+Click a check in the analysis sidebar to highlight its nodes and connections.
+Click additional checks to combine their highlights, or click a selected check
+again to remove it. Checks do not move boxes or edit the project.
+
+Enable **Simulate playthrough** in the sidebar, then use **Solve** on an available
+puzzle. Completed puzzles show an X, and moving dashes point to newly available
+work. Inaccessible elements are 80% transparent. Use **Undo** to reverse a
+completion or **Reset playthrough** to start again. Undoing a prerequisite also
+clears completions that are no longer reachable.
+
+Simulation follows each puzzle's AND/OR prerequisite rule and is also visible
+in the Pacing tab. It does not change the saved project. Disabling simulation
+restores the normal chart; enabling it again resumes the current playthrough.
 
 ## Inspector Behavior
 
@@ -171,6 +247,8 @@ Each node stores:
 - `kind`: `puzzle`, `gate`, or `reward`
 - `color`
 - optional `difficulty`
+- `prerequisiteMode`: `all` (default) or `any`
+- `narrativeReferences`: IDs of events assumed by the node's writing
 - `x`, `y`, `width`, `height`
 
 ### Edge Fields
@@ -182,8 +260,9 @@ Each dependency edge stores:
 - `to`
 - `label`
 - `tokenType`: `item`, `access`, `fact`, `state`, or `permission`
-- optional `manualRoute`
-- optional `manualLabelPosition`
+- optional `manualRoute`: saved connector waypoints, whether drawn by hand or
+  accepted from an explicitly confirmed routing action
+- optional `manualLabelPosition`: saved label position along the connector
 
 ### Group Fields
 
@@ -228,34 +307,80 @@ DepDoodle is intentionally small:
 - **Vite** for frontend development.
 - **TypeScript** for app logic.
 - **Vanilla DOM/CSS** for the UI.
-- **Graphviz WASM** via `@hpcc-js/wasm-graphviz` for graph layout and routing.
+- **D2/TALA** for graph layout and routing: a bundled native helper on desktop,
+  and `@d2lang/d2` in a background worker for the browser frontend.
 - **Lucide** for toolbar and UI icons.
 
 Important paths:
 
+- [src/layout-engine.ts](src/layout-engine.ts): D2/TALA adapter with fixed-position routing.
+- [src-d2](src-d2): bundled native D2 helper.
+- [scripts/build-d2.mjs](scripts/build-d2.mjs): platform-specific helper build.
 - [src/main.ts](src/main.ts): app state, graph editing, rendering, routing,
   import/export, analysis, and inspector logic.
 - [src/styles.css](src/styles.css): Material-style UI, canvas, nodes, groups,
   edges, welcome screen, and pacing view.
+- [src/semantics.ts](src/semantics.ts): prerequisite rules, simulation, cycles,
+  and guaranteed narrative context.
+- [src/spatial-index.ts](src/spatial-index.ts): route-label collision queries.
 - [src-tauri](src-tauri): Tauri desktop configuration and Rust shell.
-- [public/depdoodle-logo.png](public/depdoodle-logo.png): product logo.
+- [public/depdoodle-logo.svg](public/depdoodle-logo.svg): vector product logo,
+  with a [dark version](public/depdoodle-logo-dark.svg),
+  [standalone mark](public/depdoodle-mark.svg), and
+  [app icon source](public/depdoodle-icon.svg).
 - [docs/screenshots](docs/screenshots): README screenshots.
 - [PUZZLE_DEPENDENCY_CHART.md](PUZZLE_DEPENDENCY_CHART.md): puzzle dependency
   chart design memo.
 
+## Brand Assets
+
+The logo uses the original wordmark with three dependency nodes overlaid on its
+first D. The standalone marks and app icons use that same letterform and node
+placement. SVGs contain outlined lettering and do not need installed fonts.
+
+![DepDoodle logo and icons in light and dark variants](docs/brand/identity-preview.png)
+
+| Asset | Light variant | Dark variant |
+| --- | --- | --- |
+| Logo, transparent background | [SVG](public/depdoodle-logo.svg) · [PNG](public/depdoodle-logo.png) | [SVG](public/depdoodle-logo-dark.svg) · [PNG](public/depdoodle-logo-dark.png) |
+| Mark, transparent background | [SVG](public/depdoodle-mark.svg) · [PNG](public/depdoodle-mark.png) | [SVG](public/depdoodle-mark-dark.svg) · [PNG](public/depdoodle-mark-dark.png) |
+| App icon, rounded tile | [SVG](public/depdoodle-icon-light.svg) · [PNG](public/depdoodle-icon-light.png) | [SVG](public/depdoodle-icon.svg) · [PNG](public/depdoodle-icon.png) |
+
+The light logo and mark use teal lettering for light surfaces; the dark versions
+use cream lettering for dark surfaces. Logo PNGs are 1200 × 304 pixels; marks and
+app-icon PNGs are 1024 × 1024 pixels.
+
+The README and welcome screen select the matching logo for their theme. Desktop
+builds use the dark app icon, including the [macOS ICNS](src-tauri/icons/icon.icns)
+and [Windows ICO](src-tauri/icons/icon.ico). Regenerate all platform icons from
+the vector source with:
+
+```bash
+npm run tauri -- icon public/depdoodle-icon.svg --output src-tauri/icons --ios-color '#123D3C'
+```
+
 ## Releases
 
-Release builds are published on GitHub for Windows, macOS, and Linux.
+Release builds are published on
+[GitHub Releases](https://github.com/Fulviuus/depdoodle/releases) for Windows,
+macOS (Apple Silicon and Intel), and Linux.
+
+Download the installer or package for your platform from the release assets.
+Packaged builds include the D2 engine; no additional layout software is needed.
 
 The macOS builds are ad-hoc signed but not notarized. On first launch, macOS may
 block the app until it is allowed from **System Settings > Privacy & Security**.
 
 ## Development
 
+Desktop builds require Node.js, the Tauri/Rust toolchain, and Go 1.27+ for the
+bundled D2 helper. Users of packaged builds do not need Go or D2 installed.
+The helper is built automatically by `tauri dev` and `tauri build`.
+
 Install dependencies:
 
 ```bash
-npm install
+npm ci
 ```
 
 Run the desktop app:
@@ -276,6 +401,29 @@ Build the frontend:
 npm run build
 ```
 
+Run the frontend regression suite (Node.js 20, 22, or 24+):
+
+```bash
+npm test
+```
+
+Test the native D2 helper:
+
+```bash
+cd src-d2
+go test ./...
+```
+
+D2 0.9.0 is bundled under [MPL-2.0](https://github.com/d2lang/d2/blob/v0.9.0/LICENSE.txt).
+Its license and third-party notices are included in desktop builds; source is
+available at [d2lang/d2](https://github.com/d2lang/d2/tree/v0.9.0).
+The native helper avoids a WebKit WebAssembly worker stack limit. The browser
+frontend uses the WASM package and requires a compatible browser.
+
+The tests cover real D2 routing, fixed box positions, drag previews, check
+highlighting, cycles, unsaved changes, recovery, native save/open behavior,
+exports, simulation, prerequisite rules, narrative references, and focus views.
+
 Create a production Tauri build:
 
 ```bash
@@ -288,18 +436,19 @@ npm run tauri build
 - Keep graph data recoverable and human-readable.
 - Use groups for lanes, acts, characters, locations, chapters, or puzzle
   threads.
-- Let Graphviz handle graph layout and path routing where possible.
+- Use D2/TALA for confirmed box layout and automatic connection routing; lock
+  every box during connection-only routing.
 - Keep manual layout overrides explicit and saved.
 - Treat the dependency chart as design structure, not a walkthrough.
 - Use analysis to reveal risks, not to dictate one correct design.
 
 ## Current Limitations
 
-- There is no true autosave yet. Save explicitly to a `.depdoodle` file.
+- Recovery drafts are local; use Save to update the `.depdoodle` project file.
 - The app does not currently import GraphML directly from the UI.
 - Pacing bars are generated from dependency layers, not real time estimates.
-- Narrative reference checking is not implemented yet; the selected-node safe
-  context is based on graph ancestors only.
+- Narrative checking validates explicit event references; it does not infer
+  references from the prose of a memo.
 - The file format is versioned but still early.
 
 ## License

@@ -28,10 +28,14 @@ import {
   Ungroup,
   Workflow,
 } from "lucide";
-import { Graphviz } from "@hpcc-js/wasm-graphviz";
+import { loadLayoutEngine, type D2LayoutEngine, type LayoutGeometry, type LayoutMode } from "./layout-engine";
 import { isTauri } from "@tauri-apps/api/core";
-import { ask, save as showSaveDialog } from "@tauri-apps/plugin-dialog";
-import { writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { ask, open as showOpenDialog, save as showSaveDialog } from "@tauri-apps/plugin-dialog";
+import { readTextFile, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+
+import { RectangleIndex } from "./spatial-index";
+import { DependencyModel } from "./semantics";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type NodeKind = "puzzle" | "gate" | "reward";
 type Tool = "select" | "node" | "connect";
@@ -46,6 +50,8 @@ interface PuzzleNode {
   kind: NodeKind;
   color: string;
   difficulty?: number;
+  prerequisiteMode?: "all" | "any";
+  narrativeReferences?: string[];
   x: number;
   y: number;
   width: number;
@@ -98,6 +104,12 @@ interface GraphHistorySnapshot {
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
   selectedGroupId: string | null;
+}
+
+interface GraphDiagnostic {
+  key: string;
+  message: string;
+  ids: string[];
 }
 
 interface ExportBounds {
@@ -230,7 +242,7 @@ interface PacingBar {
   role: string;
 }
 
-interface GraphvizNodeLayout {
+interface RoutedNodeLayout {
   center: Point;
   x: number;
   y: number;
@@ -238,50 +250,18 @@ interface GraphvizNodeLayout {
   height: number;
 }
 
-interface GraphvizEdgeLayout {
+interface RoutedEdgeLayout {
   path: string;
   arrowPoints: Point[];
   labelX: number;
   labelY: number;
 }
 
-interface GraphvizLayout {
+interface RoutedLayout {
   width: number;
   height: number;
-  nodes: Map<string, GraphvizNodeLayout>;
-  edges: Map<string, GraphvizEdgeLayout>;
-}
-
-interface GraphvizDrawOp {
-  op: string;
-  points?: number[][];
-  pt?: number[];
-  text?: string;
-}
-
-interface GraphvizJsonNode {
-  name: string;
-  pos?: string;
-  width?: string;
-  height?: string;
-}
-
-interface GraphvizJsonEdge {
-  edgeId?: string;
-  label?: string;
-  xlabel?: string;
-  pos?: string;
-  lp?: string;
-  xlp?: string;
-  _draw_?: GraphvizDrawOp[];
-  _hdraw_?: GraphvizDrawOp[];
-  _ldraw_?: GraphvizDrawOp[];
-}
-
-interface GraphvizJson {
-  bb?: string;
-  objects?: GraphvizJsonNode[];
-  edges?: GraphvizJsonEdge[];
+  nodes: Map<string, RoutedNodeLayout>;
+  edges: Map<string, RoutedEdgeLayout>;
 }
 
 declare global {
@@ -290,7 +270,7 @@ declare global {
       autoLayout: () => Promise<void>;
       labelAttachmentReport: () => ReturnType<typeof edgeLabelAttachmentReport>;
       loadGraph: (document: GraphDocumentV1) => void;
-      waitForGraphviz: () => Promise<void>;
+      waitForRouting: () => Promise<void>;
     };
   }
 }
@@ -299,15 +279,11 @@ const EDGE_LABEL_MIN_WIDTH = 68;
 const EDGE_LABEL_MAX_WIDTH = 320;
 const EDGE_LABEL_HEIGHT = 24;
 const EDGE_LABEL_HORIZONTAL_PADDING = 24;
-const EDGE_LABEL_SIDE_GUTTER = 144;
 const EDGE_LABEL_CLEARANCE = 10;
 const EDGE_ROUTE_CLEARANCE = 8;
 const GROUP_PADDING_X = 32;
 const GROUP_PADDING_TOP = 52;
 const GROUP_PADDING_BOTTOM = 32;
-const GRAPHVIZ_POINTS_PER_INCH = 72;
-const MIN_AUTO_NODESEP = 1.35;
-const MIN_AUTO_RANKSEP = 3.6;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 2.5;
 const ZOOM_STEP = 1.2;
@@ -316,12 +292,21 @@ const EXPORT_PADDING = 56;
 const EXPORT_RASTER_SCALE = 2;
 const MAX_EXPORT_PIXELS = 96_000_000;
 const EXPORT_FONT_FAMILY = 'Roboto, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-const AUTO_LAYOUT_CONFIRM_MESSAGE = "Auto Layout will rearrange every node in this graph. You can undo it afterward. Continue?";
+const AUTO_LAYOUT_CONFIRM_MESSAGE = "Auto Layout will move every node and replace all connector routes and label positions. You can undo it afterward. Continue?";
+const REROUTE_CONFIRM_MESSAGE = "Replace the routes and label positions of visible connections? Node positions will stay the same. You can undo it afterward.";
 const RECENT_GRAPHS_STORAGE_KEY = "depdoodle.recentGraphs";
 const THEME_STORAGE_KEY = "depdoodle.theme";
 const SNAP_TO_GRID_STORAGE_KEY = "depdoodle.snapToGrid";
 const EMPTY_GRAPH_WORLD = { width: 1680, height: 1040 };
 const MAX_HISTORY_DEPTH = 100;
+const RECOVERY_STORAGE_KEY = "depdoodle.recovery";
+let savedDocumentKey = "";
+let documentSession = 0;
+let saving = false;
+let recoveryTimer: number | null = null;
+let recoveryAvailable = true;
+let nativeCloseApproved = false;
+let closeDecisionPending = false;
 
 let world = {
   ...EMPTY_GRAPH_WORLD,
@@ -337,6 +322,9 @@ let selectedNodeIds = new Set<string>();
 let selectedNodeId: string | null = null;
 let selectedEdgeId: string | null = null;
 let selectedGroupId: string | null = null;
+let selectedDiagnosticKeys = new Set<string>();
+let diagnosticNodeIds = new Set<string>();
+let diagnosticEdgeIds = new Set<string>();
 let activeTool: Tool = "select";
 let pendingConnectionFrom: string | null = null;
 let dragState: DragState | null = null;
@@ -350,11 +338,16 @@ let groupSerial = groups.length + 1;
 let undoStack: GraphHistorySnapshot[] = [];
 let redoStack: GraphHistorySnapshot[] = [];
 let graphEditBefore: GraphHistorySnapshot | null = null;
-let graphviz: Graphviz | null = null;
-let graphvizLayout: GraphvizLayout | null = null;
-let graphvizError: string | null = null;
-let graphvizRoutingDirty = true;
-let routingRefreshHandle: number | null = null;
+let layoutEngine: D2LayoutEngine | null = null;
+let layoutEngineLoadPromise: Promise<D2LayoutEngine | null> | null = null;
+let layoutActionRunning = false;
+let routingError: string | null = null;
+let automaticRoutes: RoutedLayout | null = null;
+let automaticRoutesDirty = true;
+let routingRevision = 0;
+let routingContentRevision = 0;
+let automaticRoutingPromise: Promise<void> | null = null;
+let edgePreviewHandle: number | null = null;
 let nodeGhostPosition: Point | null = null;
 let edgeLabelMeasureContext: CanvasRenderingContext2D | null = null;
 let zoom = 1;
@@ -362,6 +355,12 @@ let themeMode: ThemeMode = loadThemeMode();
 let snapToGrid = loadSnapToGrid();
 let exportMenuOpen = false;
 let activeCenterTab: CenterTab = "chart";
+let modelNodes: PuzzleNode[] | null = null;
+let modelEdges: DependencyEdge[] | null = null;
+let cachedModel: DependencyModel;
+let focusNodeIds: Set<string> | null = null;
+let simulationActive = false;
+let completedNodeIds = new Set<string>();
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -452,10 +451,14 @@ app.innerHTML = `
 
     <main class="welcome-screen" id="welcome-screen">
       <section class="welcome-main">
-        <img class="welcome-logo" src="/depdoodle-logo.png" alt="DepDoodle" />
+        <div class="welcome-logo">
+          <img class="welcome-logo-light" src="/depdoodle-logo.svg" alt="DepDoodle" width="600" height="152" />
+          <img class="welcome-logo-dark" src="/depdoodle-logo-dark.svg" alt="DepDoodle" width="600" height="152" />
+        </div>
         <h1>Puzzle dependency charts editor</h1>
         <p class="welcome-copy">Create a chart, load a saved <code>.depdoodle</code> graph, or reopen recent work.</p>
         <div class="welcome-actions">
+          <button class="secondary-button" id="recover-draft" type="button" hidden>Recover unsaved draft</button>
           <button class="welcome-action primary" id="new-graph" type="button" title="Create a new graph">
             <i data-lucide="file-plus-2"></i>
             <span>New Graph</span>
@@ -481,12 +484,21 @@ app.innerHTML = `
 
     <div class="workbench" id="workbench">
       <aside class="analysis-pane">
+        <section class="explorer"><label for="node-search">Find a puzzle</label>
+          <input id="node-search" type="search" placeholder="Search titles and memos" />
+          <div id="search-results" class="search-results"></div>
+          <button id="clear-focus" class="secondary-button" type="button" hidden>Show entire graph</button>
+        </section>
+        <section><label class="simulation-toggle"><input id="simulate-toggle" type="checkbox" /> Simulate playthrough</label>
+          <div id="simulation-panel" hidden></div>
+        </section>
         <section>
           <div class="pane-heading">
             <i data-lucide="activity"></i>
             <h2>Structure</h2>
           </div>
           <div class="metric-grid" id="metric-grid"></div>
+          <button class="secondary-button reroute-action" id="reroute-graph" type="button" title="Recalculate visible connector routes after confirmation">Reroute connections…</button>
         </section>
 
         <section>
@@ -516,9 +528,13 @@ app.innerHTML = `
             <i data-lucide="activity"></i>
             <span>Pacing</span>
           </button>
+          <span id="save-status" role="status" aria-live="polite"></span>
         </div>
 
         <section class="chart-panel" id="chart-panel" role="tabpanel" aria-labelledby="view-chart">
+          <div id="focus-banner" class="focus-banner" role="status" hidden>
+            <span id="focus-count"></span><button type="button" data-clear-focus>Show entire graph</button>
+          </div>
           <div class="canvas-ruler horizontal"></div>
           <div class="canvas-ruler vertical"></div>
           <div class="canvas-scroll" id="canvas-scroll">
@@ -590,11 +606,11 @@ resizeWorld(world.width, world.height);
 applyTheme(themeMode);
 
 must<HTMLButtonElement>("#new-graph").addEventListener("click", () => {
-  createNewGraph();
+  void createNewGraph();
 });
 
 must<HTMLButtonElement>("#load-graph").addEventListener("click", () => {
-  graphFileInput.click();
+  void openGraphFile();
 });
 
 graphFileInput.addEventListener("change", () => {
@@ -606,7 +622,7 @@ clearRecentButton.addEventListener("click", () => {
 });
 
 must<HTMLButtonElement>("#back-to-welcome").addEventListener("click", () => {
-  showWelcomeScreen();
+  void showWelcomeScreen();
 });
 
 must<HTMLButtonElement>("#view-chart").addEventListener("click", () => {
@@ -971,7 +987,7 @@ function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
   selectionBoxState = null;
   edgeRouteDragState = null;
   edgeLabelDragState = null;
-  cancelScheduledRoutingRefresh();
+  cancelScheduledEdgePreview();
   renderSelectionBox();
   syncPrimarySelection();
   if (selectedGroupId && !groups.some((group) => group.id === selectedGroupId)) {
@@ -986,10 +1002,11 @@ function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
   nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
   edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
   groupSerial = nextSerial(groups.map((group) => group.id), "g-custom-");
-  graphvizLayout = null;
-  graphvizRoutingDirty = true;
+  automaticRoutes = null;
+  invalidateAutomaticRoutes();
   resizeWorld(snapshot.world.width, snapshot.world.height);
   render();
+  noteGraphChanged();
 }
 
 function graphHistoryDataKey(snapshot: GraphHistorySnapshot) {
@@ -1031,6 +1048,7 @@ function commitGraphEdit() {
   }
 
   updateHistoryControls();
+  noteGraphChanged();
 }
 
 function resetGraphHistory() {
@@ -1120,6 +1138,8 @@ function addNodeAt(x: number, y: number) {
 
     nodeSerial += 1;
     nodes = [...nodes, node];
+    invalidateAutomaticRoutes();
+    if (focusNodeIds) focusNodeIds = new Set([...focusNodeIds, node.id]);
     selectOnlyNode(node.id);
     activeTool = "select";
     nodeGhostPosition = null;
@@ -1145,15 +1165,17 @@ function addDependency(from: string, to: string) {
 
     edgeSerial += 1;
     edges = [...edges, edge];
+    invalidateAutomaticRoutes();
     selectOnlyEdge(edge.id);
     pendingConnectionFrom = null;
     activeTool = "select";
-    markGraphvizRoutingDirty();
     render();
   });
 }
 
-function createNewGraph() {
+async function createNewGraph() {
+  if (!(await confirmLeaveGraph())) return;
+  clearRecovery();
   openGraphDocument(
     {
       format: "depdoodle.graph",
@@ -1179,6 +1201,8 @@ async function handleGraphFileInput() {
 
   try {
     const document = normalizeGraphDocument(JSON.parse(await file.text()));
+    if (!(await confirmLeaveGraph())) return;
+    clearRecovery();
     openGraphDocument(document, file.name);
   } catch (error) {
     window.alert(error instanceof Error ? error.message : "Unable to load graph file.");
@@ -1186,6 +1210,16 @@ async function handleGraphFileInput() {
 }
 
 function openGraphDocument(document: GraphDocumentV1, sourceName: string, updateRecent = true, filePath?: string) {
+  documentSession += 1;
+  clearDiagnosticSelection();
+  automaticRoutes = null;
+  invalidateAutomaticRoutes();
+  focusNodeIds = null;
+  simulationActive = false;
+  completedNodeIds = new Set();
+  must<HTMLInputElement>("#simulate-toggle").checked = false;
+  must<HTMLInputElement>("#node-search").value = "";
+  cancelRecoveryTimer();
   const normalized = normalizeGraphDocument(document);
   nodes = normalized.nodes.map((node) => ({ ...node }));
   edges = normalized.edges.map(cloneEdge);
@@ -1204,13 +1238,11 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
   nodeGhostPosition = null;
   selectionBoxState = null;
   renderSelectionBox();
-  graphvizLayout = null;
-  graphvizRoutingDirty = true;
   resetGraphHistory();
   zoom = 1;
   activeCenterTab = "chart";
 
-  const measured = measureGraphBounds(nodes);
+  const measured = measureGraphBounds(nodes, edges);
   resizeWorld(
     Math.max(normalized.world?.width ?? 0, measured.width, EMPTY_GRAPH_WORLD.width),
     Math.max(normalized.world?.height ?? 0, measured.height, EMPTY_GRAPH_WORLD.height),
@@ -1223,11 +1255,16 @@ function openGraphDocument(document: GraphDocumentV1, sourceName: string, update
     rememberGraph(normalized, sourceName, filePath);
   }
 
+  savedDocumentKey = documentDataKey(createGraphDocument());
   render();
+  updateSaveStatus();
 }
 
-function showWelcomeScreen() {
+async function showWelcomeScreen() {
+  if (!(await confirmLeaveGraph())) return;
+  clearRecovery();
   currentGraph = null;
+  clearDiagnosticSelection();
   clearSelection();
   activeTool = "select";
   nodeGhostPosition = null;
@@ -1239,53 +1276,180 @@ function showWelcomeScreen() {
   render();
 }
 
+function documentDataKey(document: GraphDocumentV1) {
+  const { world: _world, ...data } = document;
+  return JSON.stringify(data);
+}
+
+function hasUnsavedChanges() {
+  return currentGraph !== null && documentDataKey(createGraphDocument()) !== savedDocumentKey;
+}
+
+function cancelRecoveryTimer() {
+  if (recoveryTimer !== null) window.clearTimeout(recoveryTimer);
+  recoveryTimer = null;
+}
+
+function noteGraphChanged() {
+  if (!currentGraph) return;
+  cancelRecoveryTimer();
+  recoveryTimer = window.setTimeout(persistRecovery, 300);
+  updateSaveStatus();
+}
+
+function readRecovery(): { document: GraphDocumentV1; sourceName: string; filePath?: string; savedKey: string } | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(RECOVERY_STORAGE_KEY) ?? "null");
+    if (!isRecord(raw)) return null;
+    return { document: normalizeGraphDocument(raw.document), sourceName: stringValue(raw.sourceName, "Recovered draft"),
+      filePath: optionalString(raw.filePath), savedKey: stringValue(raw.savedKey, "") };
+  } catch { return null; }
+}
+
+function persistRecovery() {
+  cancelRecoveryTimer();
+  if (!currentGraph) return;
+  try {
+    if (!hasUnsavedChanges()) localStorage.removeItem(RECOVERY_STORAGE_KEY);
+    else localStorage.setItem(RECOVERY_STORAGE_KEY, JSON.stringify({ document: createGraphDocument(),
+      sourceName: currentGraph.sourceName, filePath: currentGraph.filePath, savedKey: savedDocumentKey }));
+    recoveryAvailable = true;
+  } catch { recoveryAvailable = false; }
+  updateSaveStatus();
+}
+
+function clearRecovery() {
+  cancelRecoveryTimer();
+  try { localStorage.removeItem(RECOVERY_STORAGE_KEY); } catch { /* Storage can be disabled. */ }
+}
+
+function updateSaveStatus() {
+  const status = document.querySelector<HTMLElement>("#save-status");
+  if (!status) return;
+  status.textContent = !currentGraph ? "" : saving ? "Saving…" : hasUnsavedChanges()
+    ? recoveryAvailable ? "Unsaved changes" : "Unsaved · recovery unavailable"
+    : currentGraph.sourceName === "Unsaved graph" ? "Unsaved graph" : "Saved";
+}
+
+function graphChoice(title: string, message: string, choices: Array<[string, string]>): Promise<string> {
+  return new Promise(resolve => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "save-dialog";
+    dialog.setAttribute("aria-labelledby", "save-prompt-title");
+    dialog.innerHTML = `<form method="dialog"><h2 id="save-prompt-title">${escapeHtml(title)}</h2>
+      <p>${escapeHtml(message)}</p><div class="dialog-actions">${choices.map(([value, label], index) =>
+        `<button value="${escapeAttribute(value)}" ${index === 0 ? "autofocus" : ""}>${escapeHtml(label)}</button>`).join("")}</div></form>`;
+    dialog.addEventListener("close", () => { const value = dialog.returnValue; dialog.remove(); resolve(value); }, { once: true });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
+function openRecoveryDraft() {
+  const recovery = readRecovery();
+  if (!recovery) return;
+  openGraphDocument(recovery.document, recovery.sourceName, false, recovery.filePath);
+  savedDocumentKey = recovery.savedKey;
+  noteGraphChanged();
+}
+
+async function confirmLeaveGraph() {
+  if (!currentGraph && readRecovery()) {
+    const choice = await graphChoice("An unsaved draft is available", "Recover your previous work before opening another graph, or discard the draft.",
+      [["cancel", "Cancel"], ["discard", "Discard draft"], ["recover", "Recover draft"]]);
+    if (choice === "recover") openRecoveryDraft();
+    return choice === "discard";
+  }
+  if (!hasUnsavedChanges()) return true;
+  persistRecovery();
+  const choice = await graphChoice("Save your changes?", "Your changes have not been saved to a graph file.",
+    [["cancel", "Cancel"], ["discard", "Discard changes"], ["save", "Save"]]);
+  if (choice === "discard") return true;
+  return choice === "save" && await saveGraph() && !hasUnsavedChanges();
+}
+
+async function openGraphFile(defaultPath?: string) {
+  if (!isTauriRuntime()) { graphFileInput.click(); return; }
+  const path = await showOpenDialog({ title: "Open DepDoodle Graph", defaultPath,
+    multiple: false, directory: false, filters: [{ name: "DepDoodle", extensions: ["depdoodle", "json"] }] });
+  if (typeof path !== "string") return;
+  try {
+    const graph = normalizeGraphDocument(JSON.parse(await readTextFile(path)));
+    if (!(await confirmLeaveGraph())) return;
+    clearRecovery();
+    openGraphDocument(graph, filePathDisplayName(path), true, path);
+  } catch (error) { window.alert(error instanceof Error ? error.message : "Unable to open graph."); }
+}
+
+function refreshDerivedViews() {
+  if (simulationActive) completedNodeIds = dependencyModel().validCompleted(completedNodeIds);
+  const analysis = analyzeGraph();
+  renderNodes(analysis);
+  renderEdges();
+  renderMetrics(analysis);
+  renderWidthBars(analysis);
+  renderWarnings(analysis);
+  if (activeCenterTab === "pacing") renderPacingView(analysis);
+  renderExplorer();
+  renderSimulation();
+}
+
 function setExportMenuOpen(open: boolean) {
   exportMenuOpen = open && currentGraph !== null;
   exportMenu.hidden = !exportMenuOpen;
   exportButton.setAttribute("aria-expanded", String(exportMenuOpen));
 }
 
-async function saveGraph() {
-  if (!currentGraph) {
-    return;
-  }
-
+async function saveGraph(): Promise<boolean> {
+  if (!currentGraph || saving) return false;
+  commitGraphEdit();
+  saving = true;
+  const session = documentSession;
   const document = createGraphDocument();
+  const key = documentDataKey(document);
   const filename = graphFilename(document.title, currentGraph.sourceName, "depdoodle");
   const contents = `${JSON.stringify(document, null, 2)}\n`;
-
   try {
     if (isTauriRuntime()) {
-      const filePath =
-        currentGraph.filePath ??
-        (await showSaveDialog({
-          title: "Save DepDoodle Graph",
-          defaultPath: filename,
-          filters: [{ name: "DepDoodle", extensions: ["depdoodle"] }],
-          canCreateDirectories: true,
-        }));
-
-      if (!filePath) {
-        return;
+      let filePath = currentGraph.filePath;
+      if (filePath) {
+        try {
+          await writeTextFile(filePath, contents);
+        } catch {
+          // Older recents may predate persisted permissions. Let the user
+          // select the destination again to restore access safely.
+          filePath = undefined;
+        }
       }
-
-      const outputPath = ensureFileExtension(filePath, "depdoodle");
-      await writeTextFile(outputPath, contents);
-      const sourceName = filePathDisplayName(outputPath);
-      currentGraph = { ...currentGraph, sourceName, filePath: outputPath };
-      rememberGraph(document, sourceName, outputPath);
-      return;
+      if (!filePath) {
+        const selected = await showSaveDialog({
+          title: "Save DepDoodle Graph", defaultPath: currentGraph.filePath ?? filename,
+          filters: [{ name: "DepDoodle", extensions: ["depdoodle"] }], canCreateDirectories: true,
+        });
+        if (!selected) return false;
+        filePath = selected;
+        await writeTextFile(filePath, contents);
+      }
+      if (session !== documentSession) return false;
+      const sourceName = filePathDisplayName(filePath);
+      currentGraph = { ...currentGraph!, sourceName, filePath };
+      rememberGraph(document, sourceName, filePath);
+    } else {
+      downloadBlob(new Blob([contents], { type: "application/json" }), filename);
+      if (session !== documentSession) return false;
+      currentGraph = { ...currentGraph!, sourceName: filename };
+      rememberGraph(document, filename);
     }
-
-    const blob = new Blob([contents], {
-      type: "application/json",
-    });
-
-    downloadBlob(blob, filename);
-    currentGraph = { ...currentGraph, sourceName: filename };
-    rememberGraph(document, filename);
+    savedDocumentKey = key;
+    if (!hasUnsavedChanges()) clearRecovery();
+    else persistRecovery();
+    return true;
   } catch (error) {
     window.alert(error instanceof Error ? error.message : "Unable to save graph.");
+    return false;
+  } finally {
+    saving = false;
+    updateSaveStatus();
   }
 }
 
@@ -1295,6 +1459,7 @@ async function exportGraph(format: ExportFormat) {
   }
 
   try {
+    await ensureAutomaticRouting();
     const basename = graphFilenameBase(currentGraph.title, currentGraph.sourceName);
     const extension = extensionForExportFormat(format);
     const filename = `${basename}.${extension}`;
@@ -1341,7 +1506,7 @@ function createGraphDocument(): GraphDocumentV1 {
 }
 
 function renderGraphToCanvas(): RasterExport {
-  refreshGraphvizRoutingIfNeeded();
+  refreshAutomaticRoutesIfNeeded();
 
   const bounds = measureExportBounds();
   const scale = exportScale(bounds.width, bounds.height);
@@ -1356,8 +1521,8 @@ function renderGraphToCanvas(): RasterExport {
   }
 
   context.scale(scale, scale);
-  drawExportBackground(context, bounds);
   context.translate(-bounds.left, -bounds.top);
+  drawExportBackground(context, bounds);
   drawExportGroups(context);
   drawExportEdges(context);
   drawExportNodes(context);
@@ -1803,18 +1968,19 @@ function measureExportText(text: string, font: string) {
   return edgeLabelMeasureContext.measureText(text).width;
 }
 
-function exportRouteForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
+function exportRouteForEdge(edge: DependencyEdge): RoutedEdgeLayout | null {
   return routeForEdge(edge);
 }
 
-function routeForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
+function routeForEdge(edge: DependencyEdge): RoutedEdgeLayout | null {
   const baseRoute = baseRouteForEdge(edge);
 
   if (!baseRoute) {
     return null;
   }
 
-  const manualPoints = edge.manualRoute ? routePointsForEdge(edge, edge.manualRoute) : null;
+  const manualPoints = edge.manualRoute ? routePointsForEdge(edge, edge.manualRoute)
+    : automaticRoutePreview(edge, baseRoute);
 
   if (!manualPoints) {
     const basePoints = pathPointsFromSvgPath(baseRoute.path);
@@ -1835,7 +2001,8 @@ function routeForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
   const labelPoint =
     typeof edge.manualLabelPosition === "number"
       ? pointAtPolylinePosition(manualPoints, edge.manualLabelPosition)
-      : pointAtPolylinePosition(manualPoints, 0.5);
+      : pointAtPolylinePosition(manualPoints, edge.manualRoute ? 0.5
+        : nearestPolylinePosition({ x: baseRoute.labelX, y: baseRoute.labelY }, pathPointsFromSvgPath(baseRoute.path)));
 
   return {
     path: orthogonalPath(manualPoints),
@@ -1845,13 +2012,59 @@ function routeForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
   };
 }
 
-function baseRouteForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
-  const graphvizRoute = graphvizLayout?.edges.get(edge.id);
-
-  if (graphvizRoute) {
-    return graphvizRoute;
+// While D2 is working, retain its chosen ports and bend directions. Reattaching
+// by guessing a side from the next bend made ports flip during an otherwise
+// unchanged drag, and moving every label to the midpoint added another jump.
+function automaticRoutePreview(edge: DependencyEdge, route: RoutedEdgeLayout): Point[] | null {
+  const oldFrom = automaticRoutes?.nodes.get(edge.from), oldTo = automaticRoutes?.nodes.get(edge.to);
+  const from = getNode(edge.from), to = getNode(edge.to);
+  if (!oldFrom || !oldTo || !from || !to) return null;
+  const unchanged = (before: RoutedNodeLayout, after: PuzzleNode) =>
+    before.x === after.x && before.y === after.y && before.width === after.width && before.height === after.height;
+  if (unchanged(oldFrom, from) && unchanged(oldTo, to)) return null;
+  const points = pathPointsFromSvgPath(route.path);
+  if (points.length < 2) return null;
+  const fromDelta = { x: from.x - oldFrom.x, y: from.y - oldFrom.y };
+  const toDelta = { x: to.x - oldTo.x, y: to.y - oldTo.y };
+  if (fromDelta.x === toDelta.x && fromDelta.y === toDelta.y &&
+      from.width === oldFrom.width && from.height === oldFrom.height &&
+      to.width === oldTo.width && to.height === oldTo.height) {
+    return points.map(point => translatePoint(point, fromDelta));
   }
+  const startHorizontal = Math.abs(points[0].y - points[1].y) < 0.1;
+  const endHorizontal = Math.abs(points[points.length - 1].y - points[points.length - 2].y) < 0.1;
+  if (points.length === 3 && startHorizontal === endHorizontal) {
+    points.splice(2, 0, { ...points[1] });
+  }
+  const movePort = (point: Point, before: RoutedNodeLayout, after: PuzzleNode) => ({
+    x: after.x + (point.x - before.x) * after.width / before.width,
+    y: after.y + (point.y - before.y) * after.height / before.height,
+  });
+  points[0] = movePort(points[0], oldFrom, from);
+  points[points.length - 1] = movePort(points[points.length - 1], oldTo, to);
+  if (points.length === 2) {
+    const [start, end] = points;
+    if (!isOrthogonalSegment(start, end)) {
+      if (startHorizontal) {
+        const x = (start.x + end.x) / 2;
+        points.splice(1, 0, { x, y: start.y }, { x, y: end.y });
+      } else {
+        const y = (start.y + end.y) / 2;
+        points.splice(1, 0, { x: start.x, y }, { x: end.x, y });
+      }
+    }
+  } else {
+    if (startHorizontal) points[1].y = points[0].y;
+    else points[1].x = points[0].x;
+    if (endHorizontal) points[points.length - 2].y = points[points.length - 1].y;
+    else points[points.length - 2].x = points[points.length - 1].x;
+  }
+  return compactRoutePoints(points);
+}
 
+function baseRouteForEdge(edge: DependencyEdge): RoutedEdgeLayout | null {
+  const routed = automaticRoutes?.edges.get(edge.id);
+  if (routed) return routed;
   const from = getNode(edge.from);
   const to = getNode(edge.to);
 
@@ -1871,7 +2084,7 @@ function baseRouteForEdge(edge: DependencyEdge): GraphvizEdgeLayout | null {
 }
 
 function routePointsForEdge(edge: DependencyEdge, points: Point[]) {
-  const routePoints = cleanManualRoutePoints(points);
+  const routePoints = compactRoutePoints(points);
 
   if (routePoints.length < 2) {
     return null;
@@ -1888,7 +2101,7 @@ function routePointsForEdge(edge: DependencyEdge, points: Point[]) {
   adjusted[0] = anchorPointForNode(from, adjusted[1]);
   adjusted[adjusted.length - 1] = anchorPointForNode(to, adjusted[adjusted.length - 2]);
 
-  return cleanManualRoutePoints(orthogonalizeEndpointSegments(adjusted, from, to));
+  return compactRoutePoints(orthogonalizeEndpointSegments(adjusted, from, to));
 }
 
 function anchorPointForNode(node: PuzzleNode, neighbor: Point): Point {
@@ -2303,7 +2516,7 @@ function compactRoutePoints(points: Point[]) {
 }
 
 function renderGraphToSvgBlob() {
-  refreshGraphvizRoutingIfNeeded();
+  refreshAutomaticRoutesIfNeeded();
 
   return new Blob([renderGraphToSvg(measureExportBounds())], {
     type: "image/svg+xml;charset=utf-8",
@@ -2812,79 +3025,79 @@ async function confirmAutoLayout() {
   return window.confirm(AUTO_LAYOUT_CONFIRM_MESSAGE);
 }
 
-async function autoArrange(options: { confirm?: boolean } = {}) {
-  if (options.confirm !== false && !(await confirmAutoLayout())) {
-    return;
-  }
-
-  beginGraphEdit();
-
-  if (graphviz) {
-    applyGraphvizAutoLayout();
-    commitGraphEdit();
-    return;
-  }
-
-  const topology = getTopology();
-  const layerMap = topology.layerByNode;
-  const layers = topology.layers.length > 0 ? topology.layers : [nodes];
-  const xGap = 292;
-  const yGap = 152;
-
-  nodes = nodes.map((node) => {
-    const layer = layerMap.get(node.id) ?? 0;
-    const layerNodes = layers[layer] ?? [node];
-    const index = layerNodes.findIndex((layerNode) => layerNode.id === node.id);
-
-    return {
-      ...node,
-      x: 94 + layer * xGap,
-      y: 126 + Math.max(index, 0) * yGap,
-    };
-  });
-
-  edges = edges.map(clearEdgeLayoutOverrides);
-  selectedEdgeId = null;
-  canvasScroll.scrollLeft = 0;
-  canvasScroll.scrollTop = 0;
-  render();
-  commitGraphEdit();
+async function autoArrange() {
+  if (layoutActionRunning || !currentGraph) return;
+  const session = documentSession;
+  layoutActionRunning = true;
+  try {
+    if (!(await confirmAutoLayout()) || session !== documentSession) return;
+    if (!(await initializeLayoutEngine()) || session !== documentSession) { render(); return; }
+    const revision = routingRevision;
+    try {
+      const layout = await computeRoutedLayout("auto");
+      if (session !== documentSession || revision !== routingRevision) return;
+      withGraphEdit(() => {
+        nodes = nodes.map(node => {
+          const position = layout.nodes.get(node.id);
+          return position ? { ...node, x: position.x, y: position.y } : node;
+        });
+        acceptRoutedLayout(layout);
+        routingError = null;
+        canvasScroll.scrollLeft = 0;
+        canvasScroll.scrollTop = 0;
+        render();
+      });
+    } catch (error) {
+      if (session !== documentSession) return;
+      routingError = error instanceof Error ? error.message : "Unable to arrange this graph.";
+      render();
+    }
+  } finally { layoutActionRunning = false; }
 }
 
-function applyGraphvizAutoLayout() {
-  let layout: GraphvizLayout;
-
+async function rerouteConnections() {
+  if (layoutActionRunning || !currentGraph || !visibleEdges().length) return;
+  const session = documentSession;
+  layoutActionRunning = true;
   try {
-    layout = computeGraphvizLayout("auto");
-    graphvizError = null;
-  } catch (error) {
-    graphvizError = error instanceof Error ? error.message : "Unknown layout failure";
-    refreshGraphvizRouting();
-    render();
-    return;
-  }
-
-  nodes = nodes.map((node) => {
-    const nodeLayout = layout.nodes.get(node.id);
-
-    if (!nodeLayout) {
-      return node;
+    const confirmed = isTauriRuntime()
+      ? await ask(REROUTE_CONFIRM_MESSAGE, { title: "Reroute connections", kind: "warning", okLabel: "Reroute", cancelLabel: "Cancel" })
+      : window.confirm(REROUTE_CONFIRM_MESSAGE);
+    if (!confirmed || session !== documentSession) return;
+    if (!(await initializeLayoutEngine()) || session !== documentSession) { render(); return; }
+    const revision = routingRevision;
+    try {
+      const layout = await computeRoutedLayout("fixed");
+      if (session !== documentSession || revision !== routingRevision) return;
+      withGraphEdit(() => {
+        acceptRoutedLayout(layout);
+        routingError = null;
+        render();
+      });
+    } catch (error) {
+      if (session !== documentSession) return;
+      routingError = error instanceof Error ? error.message : "Unable to reroute connections.";
+      render();
     }
+  } finally { layoutActionRunning = false; }
+}
 
-    return {
-      ...node,
-      x: nodeLayout.x,
-      y: nodeLayout.y,
-    };
+// Accepted geometry is document data, never a disposable render cache. This
+// makes reopen, export, undo and view changes reproduce the same waypoints.
+function acceptRoutedLayout(layout: RoutedLayout) {
+  routingRevision += 1;
+  routingContentRevision += 1;
+  edges = edges.map(edge => {
+    const route = layout.edges.get(edge.id);
+    if (!route) return edge;
+    const points = compactRoutePoints(pathPointsFromSvgPath(route.path));
+    if (points.length < 2) return edge;
+    return { ...edge, manualRoute: points,
+      manualLabelPosition: nearestPolylinePosition({ x: route.labelX, y: route.labelY }, points) };
   });
-
-  edges = edges.map(clearEdgeLayoutOverrides);
-  graphvizLayout = layout;
-  graphvizRoutingDirty = false;
-  selectedEdgeId = null;
-  canvasScroll.scrollLeft = 0;
-  canvasScroll.scrollTop = 0;
-  render();
+  automaticRoutes = layout;
+  automaticRoutesDirty = false;
+  resizeWorld(Math.max(world.width, layout.width), Math.max(world.height, layout.height));
 }
 
 function deleteSelection() {
@@ -2901,11 +3114,8 @@ function deleteSelection() {
         return;
       }
 
-      const affectsRouting = deleteNodesById(nodeIds);
+      deleteNodesById(nodeIds);
       clearSelection();
-      if (affectsRouting) {
-        markGraphvizRoutingDirty();
-      }
       render();
     });
     return;
@@ -2920,9 +3130,9 @@ function deleteSelection() {
       }
 
       edges = edges.filter((edge) => edge.id !== edgeId);
+      invalidateAutomaticRoutes();
       clearSelection();
-      markGraphvizRoutingDirty();
-      render();
+        render();
     });
   }
 }
@@ -2969,7 +3179,6 @@ function toggleGroupHidden(groupId: string) {
   withGraphEdit(() => {
     updateGroup(groupId, { hidden: !group.hidden });
     selectOnlyGroup(groupId);
-    markGraphvizRoutingDirty();
     render();
   });
 }
@@ -2984,7 +3193,6 @@ function ungroup(groupId: string) {
   withGraphEdit(() => {
     groups = groups.filter((candidate) => candidate.id !== groupId);
     setSelectedNodes(group.nodeIds, group.nodeIds[0]);
-    markGraphvizRoutingDirty();
     render();
   });
 }
@@ -3012,18 +3220,15 @@ async function deleteGroupWithConfirmation(groupId: string) {
   }
 
   withGraphEdit(() => {
-    const affectsRouting = deleteNodesById(new Set(group.nodeIds));
+    deleteNodesById(new Set(group.nodeIds));
     groups = groups.filter((candidate) => candidate.id !== groupId);
     clearSelection();
-    if (affectsRouting) {
-      markGraphvizRoutingDirty();
-    }
     render();
   });
 }
 
 function deleteNodesById(nodeIds: Set<string>) {
-  const affectsRouting = [...nodeIds].some(isRoutedNode);
+  invalidateAutomaticRoutes();
   nodes = nodes.filter((node) => !nodeIds.has(node.id));
   edges = edges.filter((edge) => !nodeIds.has(edge.from) && !nodeIds.has(edge.to));
   groups = groups
@@ -3037,10 +3242,10 @@ function deleteNodesById(nodeIds: Set<string>) {
     selectedGroupId = null;
   }
 
-  return affectsRouting;
 }
 
 function render() {
+  if (simulationActive) completedNodeIds = dependencyModel().validCompleted(completedNodeIds);
   renderAppMode();
 
   if (!currentGraph) {
@@ -3050,7 +3255,7 @@ function render() {
     return;
   }
 
-  refreshGraphvizRoutingIfNeeded();
+  refreshAutomaticRoutesIfNeeded();
   const analysis = analyzeGraph();
 
   renderCenterTabs();
@@ -3062,8 +3267,11 @@ function render() {
   renderMetrics(analysis);
   renderWidthBars(analysis);
   renderWarnings(analysis);
-  renderPacingView(analysis);
+  if (activeCenterTab === "pacing") renderPacingView(analysis);
   renderInspector();
+  renderExplorer();
+  renderSimulation();
+  updateSaveStatus();
   ensureButtonTooltips();
   hydrateIcons();
 }
@@ -3092,6 +3300,7 @@ function renderCenterTabs() {
 }
 
 function renderWelcome() {
+  must<HTMLButtonElement>("#recover-draft").hidden = !readRecovery();
   clearRecentButton.hidden = recentGraphs.length === 0;
 
   if (recentGraphs.length === 0) {
@@ -3118,15 +3327,27 @@ function renderWelcome() {
     .join("");
 
   recentList.querySelectorAll<HTMLButtonElement>(".recent-open").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       const recent = recentGraphs.find((candidate) => candidate.id === button.dataset.recentOpen);
 
       if (!recent) {
         return;
       }
 
-      openGraphDocument(recent.document, recent.sourceName, false, recent.filePath);
-      rememberGraph(recent.document, recent.sourceName, recent.filePath);
+      if (!(await confirmLeaveGraph())) return;
+      if (isTauriRuntime() && recent.filePath) {
+        try {
+          const document = normalizeGraphDocument(JSON.parse(await readTextFile(recent.filePath)));
+          clearRecovery();
+          openGraphDocument(document, recent.sourceName, true, recent.filePath);
+        } catch {
+          window.alert("This file could not be opened. Locate it again, or recover an unsaved draft if one is available.");
+          await openGraphFile(recent.filePath);
+        }
+      } else {
+        clearRecovery();
+        openGraphDocument(recent.document, recent.sourceName, true);
+      }
     });
   });
 
@@ -3150,6 +3371,7 @@ function renderToolbar() {
   }
 
   updateHistoryControls();
+  must<HTMLButtonElement>("#reroute-graph").disabled = visibleEdges().length === 0;
   updateSnapGridControl();
   layoutActionLabel.textContent = "Auto Layout";
   autoLayoutButton.title = "Rearrange nodes by dependency layers";
@@ -3158,12 +3380,14 @@ function renderToolbar() {
 function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
   const roots = new Set(analysis.roots.map((node) => node.id));
   const leaves = new Set(analysis.leaves.map((node) => node.id));
+  const available = simulationAvailableNodes();
 
   nodeLayer.innerHTML = visibleNodes()
     .map((node) => {
       const incoming = incomingEdges(node.id).length;
       const outgoing = outgoingEdges(node.id).length;
-      const selected = selectedNodeIds.has(node.id) ? " selected" : "";
+      const selected = (selectedNodeIds.has(node.id) ? " selected" : "") +
+        simulationNodeClass(node.id, available);
       const pending = node.id === pendingConnectionFrom ? " pending-connect" : "";
       const role = roots.has(node.id) ? "Root" : leaves.has(node.id) ? "Leaf" : "Linked";
       const difficultyMarkup =
@@ -3175,6 +3399,7 @@ function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
           data-node-id="${escapeHtml(node.id)}"
           style="left: ${node.x}px; top: ${node.y}px; width: ${node.width}px; height: ${node.height}px; --node-color: ${nodeColor(node)};"
         >
+          ${completionCross(node.id)}
           <div class="node-topline">
             <span class="kind-swatch" aria-hidden="true"></span>
             <span>${escapeHtml(labelForKind(node.kind))}</span>
@@ -3186,6 +3411,8 @@ function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
             <span>${incoming} in</span>
             <span>${outgoing} out</span>
             ${difficultyMarkup}
+            ${available && (available.has(node.id) || completedNodeIds.has(node.id))
+              ? `<button class="node-solve-action" type="button" data-toggle-solved="${escapeAttribute(node.id)}" aria-pressed="${completedNodeIds.has(node.id)}" aria-label="${escapeAttribute(`${completedNodeIds.has(node.id) ? "Undo completion of" : "Mark solved:"} ${node.title}`)}">${completedNodeIds.has(node.id) ? "Undo" : "Solve"}</button>` : ""}
           </div>
         </article>
       `;
@@ -3205,7 +3432,20 @@ function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
     });
   });
 
+  nodeLayer.querySelectorAll<HTMLButtonElement>("[data-toggle-solved]").forEach(button => {
+    button.addEventListener("pointerdown", event => event.stopPropagation());
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      const id = button.dataset.toggleSolved!;
+      toggleCompleted(id);
+      // The Solve button becomes Undo; keep keyboard focus on that control.
+      [...nodeLayer.querySelectorAll<HTMLButtonElement>("[data-toggle-solved]")]
+        .find(candidate => candidate.dataset.toggleSolved === id)?.focus({ preventScroll: true });
+    });
+  });
+
   renderNodeGhost();
+  applyDiagnosticHighlights(nodeLayer);
 }
 
 function renderNodeGhost() {
@@ -3270,6 +3510,7 @@ function renderSelectionBox() {
 }
 
 function renderGroups() {
+  const available = simulationAvailableNodes();
   groupLayer.innerHTML = groups
     .map((group) => {
       const bounds = groupBounds(group);
@@ -3279,6 +3520,8 @@ function renderGroups() {
       }
 
       const selected = group.id === selectedGroupId ? " selected" : "";
+      const blocked = available && group.nodeIds.length && group.nodeIds.every(id =>
+        !completedNodeIds.has(id) && !available.has(id)) ? " simulation-blocked" : "";
       const hidden = group.hidden ? " hidden" : "";
       const icon = group.hidden ? "eye-off" : "eye";
       const title = group.hidden ? "Show group" : "Hide group";
@@ -3287,7 +3530,7 @@ function renderGroups() {
 
       return `
         <section
-          class="group-box${selected}${hidden}"
+          class="group-box${selected}${hidden}${blocked}"
           data-group-id="${escapeAttribute(group.id)}"
           style="left: ${bounds.left}px; top: ${bounds.top}px; width: ${bounds.right - bounds.left}px; height: ${bounds.bottom - bounds.top}px; --group-color: ${escapeAttribute(color)};"
         >
@@ -3328,10 +3571,13 @@ function renderGroups() {
       }
     });
   });
+  applyDiagnosticHighlights(groupLayer);
 }
 
-function renderEdges() {
-  const edgeMarkup = visibleEdges()
+function renderEdges(onlyIds?: Set<string>) {
+  refreshAutomaticRoutesIfNeeded();
+  const available = simulationAvailableNodes();
+  const edgeMarkup = visibleEdges().filter(edge => !onlyIds || onlyIds.has(edge.id))
     .map((edge) => {
       const route = routeForEdge(edge);
 
@@ -3339,7 +3585,11 @@ function renderEdges() {
         return "";
       }
 
-      const selected = edge.id === selectedEdgeId ? " selected" : "";
+      const selected = edge.id === selectedEdgeId ||
+        (selectedNodeIds.has(edge.from) && selectedNodeIds.has(edge.to)) ? " selected" : "";
+      const flowing = available && completedNodeIds.has(edge.from) && available.has(edge.to);
+      const simulation = !available ? "" : flowing ? " simulation-flowing"
+        : completedNodeIds.has(edge.from) && completedNodeIds.has(edge.to) ? " simulation-traversed" : " simulation-blocked";
       const rawLabel = edge.label.trim();
       const label = escapeHtml(rawLabel);
       const labelMetrics = measureEdgeLabel(rawLabel);
@@ -3355,8 +3605,9 @@ function renderEdges() {
       const arrow = arrowPoints ? `<polygon class="edge-arrow" points="${arrowPoints}"></polygon>` : "";
 
       return `
-        <g class="edge-group${selected}" data-edge-id="${escapeHtml(edge.id)}">
+        <g class="edge-group${selected}${simulation}" data-edge-id="${escapeHtml(edge.id)}">
           <path class="edge-path" d="${route.path}"></path>
+          ${flowing ? `<path class="edge-flow" d="${route.path}" aria-hidden="true"></path>` : ""}
           ${arrow}
           <path class="edge-hit edge-pick" d="${route.path}" data-edge-id="${escapeHtml(edge.id)}"></path>
           ${labelMarkup}
@@ -3365,26 +3616,142 @@ function renderEdges() {
     })
     .join("");
 
-  edgeLayer.innerHTML = edgeMarkup;
-
-  edgeLayer.querySelectorAll<SVGElement>(".edge-pick").forEach((target) => {
-    target.addEventListener("pointerdown", (event) => {
-      const edgeId = target.dataset.edgeId;
-
-      if (!edgeId) {
-        return;
-      }
-
-      event.stopPropagation();
-
-      if (target.classList.contains("edge-label-pick")) {
-        beginEdgeLabelDrag(event, edgeId);
-        return;
-      }
-
-      beginEdgeRouteDrag(event, edgeId);
+  if (!onlyIds) edgeLayer.innerHTML = edgeMarkup;
+  else {
+    const staging = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    staging.innerHTML = edgeMarkup;
+    const replacements = new Map([...staging.children].map(element => [(element as SVGElement).dataset.edgeId, element]));
+    edgeLayer.querySelectorAll<SVGElement>(".edge-group").forEach(element => {
+      if (!onlyIds.has(element.dataset.edgeId ?? "")) return;
+      const replacement = replacements.get(element.dataset.edgeId);
+      if (replacement) element.replaceWith(replacement); else element.remove();
     });
-  });
+  }
+  applyDiagnosticHighlights(edgeLayer);
+}
+
+// Checks and search navigate without changing which graph elements are shown.
+// Only the explicit Focus actions isolate a subgraph.
+function inspectNodes(ids: Iterable<string>, primaryId?: string) {
+  const known = [...new Set(ids)].filter(id => !!getNode(id));
+  if (!known.length) return;
+  const wasFocused = focusNodeIds !== null;
+  focusNodeIds = null;
+  setSelectedNodes(known, primaryId);
+  activeCenterTab = "chart";
+  if (wasFocused) {
+    render();
+  } else {
+    renderCenterTabs();
+    renderGroups();
+    renderNodes();
+    renderEdges();
+    renderInspector();
+    renderExplorer();
+    ensureButtonTooltips();
+    hydrateIcons();
+  }
+  revealNodesAtCurrentZoom(known);
+}
+
+function revealNodesAtCurrentZoom(ids: string[]) {
+  const candidates = ids.map(id => getNode(id)).filter((node): node is PuzzleNode => !!node && !isNodeHidden(node.id));
+  if (!candidates.length) return;
+  const margin = 32 / zoom;
+  const width = canvasScroll.clientWidth / zoom;
+  const height = canvasScroll.clientHeight / zoom;
+  if (width <= 0 || height <= 0) return;
+  let left = minOf(candidates.map(node => node.x), 0) - margin;
+  let top = minOf(candidates.map(node => node.y), 0) - margin;
+  let right = maxOf(candidates.map(node => node.x + node.width), 0) + margin;
+  let bottom = maxOf(candidates.map(node => node.y + node.height), 0) + margin;
+  // Widely separated warnings may not fit. Reveal the first target rather than
+  // zooming out and making the whole chart unexpectedly tiny.
+  if (right - left > width || bottom - top > height) {
+    const first = candidates[0];
+    left = first.x - margin; top = first.y - margin;
+    right = first.x + first.width + margin; bottom = first.y + first.height + margin;
+  }
+  const scrollX = canvasScroll.scrollLeft / zoom;
+  const scrollY = canvasScroll.scrollTop / zoom;
+  if (left < scrollX) canvasScroll.scrollLeft = Math.max(0, left * zoom);
+  else if (right > scrollX + width) canvasScroll.scrollLeft = Math.max(0, (right - width) * zoom);
+  if (top < scrollY) canvasScroll.scrollTop = Math.max(0, top * zoom);
+  else if (bottom > scrollY + height) canvasScroll.scrollTop = Math.max(0, (bottom - height) * zoom);
+}
+
+function clearFocus() {
+  focusNodeIds = null;
+  render();
+  fitGraphToView();
+}
+
+function focusOnNodes(ids: Iterable<string>, selectedId?: string) {
+  const known = [...ids].filter(id => !!getNode(id));
+  focusNodeIds = new Set(known);
+  // A requested focus should remain visible even inside a hidden group.
+  if (selectedId) selectOnlyNode(selectedId); else setSelectedNodes(known);
+  activeCenterTab = "chart";
+  render();
+  fitNodesToView(known);
+}
+
+function fitNodesToView(ids: string[]) {
+  const focus = ids.map(id => getNode(id)).filter((node): node is PuzzleNode => !!node);
+  if (!focus.length) return;
+  const left = minOf(focus.map(node => node.x), 0);
+  const top = minOf(focus.map(node => node.y), 0);
+  const right = maxOf(focus.map(node => node.x + node.width), world.width);
+  const bottom = maxOf(focus.map(node => node.y + node.height), world.height);
+  zoom = clamp(Math.min((canvasScroll.clientWidth - 80) / Math.max(1, right-left), (canvasScroll.clientHeight - 80) / Math.max(1, bottom-top), 1.5), MIN_ZOOM, MAX_ZOOM);
+  applyZoom();
+  canvasScroll.scrollLeft = Math.max(0, left * zoom - 40);
+  canvasScroll.scrollTop = Math.max(0, top * zoom - 40);
+}
+
+function renderExplorer() {
+  const query = must<HTMLInputElement>("#node-search").value.trim().toLowerCase();
+  const matching = query ? nodes.filter(node => `${node.title} ${node.note} ${node.id}`.toLowerCase().includes(query)) : [];
+  must<HTMLElement>("#search-results").innerHTML = matching.slice(0, 50).map(node => `<button type="button" data-search-node="${escapeAttribute(node.id)}">${escapeHtml(node.title)}</button>`).join("")
+    + (query && !matching.length ? `<p>No puzzles found.</p>` : matching.length > 50 ? `<p>${matching.length - 50} more results. Refine your search.</p>` : "");
+  must<HTMLButtonElement>("#clear-focus").hidden = !focusNodeIds;
+  must<HTMLElement>("#focus-banner").hidden = !focusNodeIds;
+  must<HTMLElement>("#focus-count").textContent = focusNodeIds ? `Focused view: ${visibleNodes().length} of ${nodes.length} puzzles` : "";
+}
+
+function simulationAvailableNodes(): Set<string> | null {
+  return simulationActive ? new Set(dependencyModel().available(completedNodeIds)) : null;
+}
+
+function simulationNodeClass(id: string, available: ReadonlySet<string> | null) {
+  return !available ? "" : completedNodeIds.has(id) ? " simulation-complete"
+    : available.has(id) ? " simulation-available" : " simulation-blocked";
+}
+
+function completionCross(id: string) {
+  return simulationActive && completedNodeIds.has(id)
+    ? `<svg class="completion-cross" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path d="M 4 4 L 96 96 M 96 4 L 4 96" vector-effect="non-scaling-stroke" /></svg>` : "";
+}
+
+function renderSimulation() {
+  const panel = must<HTMLElement>("#simulation-panel");
+  panel.hidden = !simulationActive;
+  if (!simulationActive) return;
+  completedNodeIds = dependencyModel().validCompleted(completedNodeIds);
+  const available = dependencyModel().available(completedNodeIds);
+  const blocked = nodes.length - completedNodeIds.size - available.length;
+  panel.innerHTML = `<p role="status">${completedNodeIds.size} solved · ${available.length} available · ${blocked} blocked</p>
+    <p class="field-help">Solve puzzles on the chart; use Undo to reopen them.</p>
+    <div class="simulation-list">${available.map(id => `<button type="button" data-solve="${escapeAttribute(id)}">Solve: ${escapeHtml(getNode(id)?.title ?? id)}</button>`).join("")}</div>
+    ${!available.length && blocked ? `<p>No available puzzles. Check for circular locks.</p>` : ""}
+    <button type="button" id="reset-simulation">Reset playthrough</button>`;
+}
+
+function toggleCompleted(id: string) {
+  if (completedNodeIds.has(id)) completedNodeIds.delete(id);
+  else if (dependencyModel().canSolve(id, completedNodeIds)) completedNodeIds.add(id);
+  completedNodeIds = dependencyModel().validCompleted(completedNodeIds);
+  render();
 }
 
 function renderMetrics(analysis: GraphAnalysis) {
@@ -3428,18 +3795,82 @@ function renderWidthBars(analysis: GraphAnalysis) {
     .join("");
 }
 
-function renderWarnings(analysis: GraphAnalysis) {
-  if (analysis.warnings.length === 0) {
-    warningsPanel.innerHTML = `<p class="empty-state">No structural warnings in this chart.</p>`;
-    return;
-  }
+function graphDiagnostics(analysis: GraphAnalysis): GraphDiagnostic[] {
+  const diagnostics: GraphDiagnostic[] = [];
+  if (analysis.topology.hasCycle) diagnostics.push({ key: "cycle", message: "Cycle detected. Select to inspect the circular dependencies.", ids: [...dependencyModel().cycleNodes()] });
+  if (!analysis.roots.length && nodes.length) diagnostics.push({ key: "no-roots", message: "No root nodes. The player may have no starting puzzle.", ids: nodes.map(node => node.id) });
+  analysis.leaves.filter(node => node.kind !== "reward").forEach(node => diagnostics.push({ key: JSON.stringify(["leaf", node.id]), message: `Non-reward leaf: ${node.title}.`, ids: [node.id] }));
+  analysis.topology.layers.forEach((layer, index) => {
+    if (layer.length > 5) diagnostics.push({ key: `broad-layer:${index}`, message: `Broad layer: ${layer.length} puzzles.`, ids: layer.map(node => node.id) });
+  });
+  dependencyModel().narrativeIssues().forEach(issue => diagnostics.push({
+    key: JSON.stringify(["narrative", issue.nodeId, issue.referenceId]),
+    message: `${getNode(issue.nodeId)?.title}: ${issue.missing ? "missing" : "unguaranteed"} narrative reference to ${getNode(issue.referenceId)?.title ?? issue.referenceId}.`,
+    ids: [issue.nodeId, ...(issue.missing ? [] : [issue.referenceId])],
+  }));
+  if (routingError) diagnostics.push({ key: "routing", message: `Connection routing error: ${routingError}`, ids: [] });
+  if (!analysis.bottlenecks.length && nodes.length > 3) diagnostics.push({ key: "no-closers", message: "No closers yet. Consider where branches intentionally collapse.", ids: [] });
+  return diagnostics;
+}
 
-  warningsPanel.innerHTML = analysis.warnings
-    .map((warning) => `<p class="warning-item">${escapeHtml(warning)}</p>`)
-    .join("");
+function clearDiagnosticSelection() {
+  selectedDiagnosticKeys.clear();
+  diagnosticNodeIds.clear();
+  diagnosticEdgeIds.clear();
+}
+
+function reconcileDiagnosticSelection(diagnostics: GraphDiagnostic[]) {
+  const active = diagnostics.filter(item => item.ids.length && selectedDiagnosticKeys.has(item.key));
+  selectedDiagnosticKeys = new Set(active.map(item => item.key));
+  diagnosticNodeIds = new Set(active.flatMap(item => item.ids));
+  diagnosticEdgeIds = new Set(edges
+    .filter(edge => diagnosticNodeIds.has(edge.from) && diagnosticNodeIds.has(edge.to))
+    .map(edge => edge.id));
+}
+
+function applyDiagnosticHighlights(root: ParentNode = document) {
+  const active = selectedDiagnosticKeys.size > 0;
+  root.querySelectorAll<HTMLElement | SVGElement>(".node, .edge-group, .group-box, .pacing-bar").forEach(element => {
+    const highlighted = active && (element.matches(".edge-group")
+      ? diagnosticEdgeIds.has(element.dataset.edgeId ?? "")
+      : diagnosticNodeIds.has(element.dataset.nodeId ?? ""));
+    element.classList.toggle("check-highlighted", highlighted);
+    element.classList.toggle("check-dimmed", active && !highlighted);
+  });
+}
+
+function toggleDiagnostic(key: string) {
+  const analysis = analyzeGraph();
+  const diagnostics = graphDiagnostics(analysis);
+  if (selectedDiagnosticKeys.has(key)) selectedDiagnosticKeys.delete(key);
+  else selectedDiagnosticKeys.add(key);
+  reconcileDiagnosticSelection(diagnostics);
+  if (diagnosticNodeIds.size) inspectNodes(diagnosticNodeIds);
+  else {
+    clearSelection();
+    focusNodeIds = null;
+    render();
+  }
+  renderWarnings(analysis);
+}
+
+function renderWarnings(analysis: GraphAnalysis) {
+  const diagnostics = graphDiagnostics(analysis);
+  reconcileDiagnosticSelection(diagnostics);
+  const focusedKey = (document.activeElement as HTMLElement | null)?.dataset.diagnostic;
+  warningsPanel.innerHTML = diagnostics.length ? diagnostics.map(item => item.ids.length
+    ? `<button class="warning-item diagnostic" data-diagnostic="${escapeAttribute(item.key)}" type="button" aria-pressed="${selectedDiagnosticKeys.has(item.key)}"><span class="diagnostic-indicator" aria-hidden="true"></span><span>${escapeHtml(item.message)}</span></button>`
+    : `<p class="warning-item">${escapeHtml(item.message)}</p>`).join("")
+    : `<p class="empty-state">No structural warnings in this chart.</p>`;
+  warningsPanel.querySelectorAll<HTMLButtonElement>("[data-diagnostic]").forEach(button => {
+    button.addEventListener("click", () => toggleDiagnostic(button.dataset.diagnostic!));
+    if (button.dataset.diagnostic === focusedKey) button.focus({ preventScroll: true });
+  });
+  applyDiagnosticHighlights();
 }
 
 function renderPacingView(analysis: GraphAnalysis) {
+  const available = simulationAvailableNodes();
   if (nodes.length === 0) {
     pacingBoard.innerHTML = `
       <div class="pacing-empty">
@@ -3453,7 +3884,8 @@ function renderPacingView(analysis: GraphAnalysis) {
   const layerCount = Math.max(1, analysis.topology.layers.length);
   const lanes = buildPacingLanes(analysis);
   const bars = buildPacingBars(analysis, lanes, layerCount);
-  const barsByLane = new Map(lanes.map((lane) => [lane.id, bars.filter((bar) => bar.laneId === lane.id)]));
+  const barsByLane = new Map<string, PacingBar[]>(lanes.map(lane => [lane.id, []]));
+  bars.forEach(bar => barsByLane.get(bar.laneId)?.push(bar));
   const layerWidths = Array.from({ length: layerCount }, (_, index) => analysis.topology.layers[index]?.length ?? 0);
   const widestLayerWidth = maxOf(layerWidths, 0);
   const widestLayer = layerWidths.indexOf(widestLayerWidth);
@@ -3509,7 +3941,7 @@ function renderPacingView(analysis: GraphAnalysis) {
           .join("")}
       </div>
       ${lanes
-        .map((lane) => renderPacingLane(lane, barsByLane.get(lane.id) ?? [], layerCount))
+        .map((lane) => renderPacingLane(lane, barsByLane.get(lane.id) ?? [], layerCount, available))
         .join("")}
     </section>
   `;
@@ -3526,10 +3958,11 @@ function renderPacingView(analysis: GraphAnalysis) {
       render();
     });
   });
+  applyDiagnosticHighlights(pacingBoard);
 }
 
-function renderPacingLane(lane: PacingLane, bars: PacingBar[], layerCount: number) {
-  const trackCount = Math.max(1, ...bars.map((bar) => bar.track + 1));
+function renderPacingLane(lane: PacingLane, bars: PacingBar[], layerCount: number, available: ReadonlySet<string> | null) {
+  const trackCount = Math.max(1, maxOf(bars.map((bar) => bar.track + 1), 1));
   const nodeCount = bars.length;
 
   return `
@@ -3540,14 +3973,14 @@ function renderPacingLane(lane: PacingLane, bars: PacingBar[], layerCount: numbe
         <small>${nodeCount} ${nodeCount === 1 ? "node" : "nodes"}</small>
       </div>
       ${Array.from({ length: layerCount }, (_, index) => `<div class="pacing-cell" style="grid-column: ${index + 2}; grid-row: 1 / span ${trackCount};"></div>`).join("")}
-      ${bars.map((bar) => renderPacingBar(bar)).join("")}
+      ${bars.map((bar) => renderPacingBar(bar, available)).join("")}
     </div>
   `;
 }
 
-function renderPacingBar(bar: PacingBar) {
-  const selected = selectedNodeIds.has(bar.node.id) ? " selected" : "";
-  const title = `${bar.node.title}: ${bar.role}. Layers ${bar.startLayer + 1}-${bar.endLayer + 1}. ${bar.incoming} in, ${bar.outgoing} out. Safe facts: ${getAncestors(bar.node.id).length}.`;
+function renderPacingBar(bar: PacingBar, available: ReadonlySet<string> | null) {
+  const selected = (selectedNodeIds.has(bar.node.id) ? " selected" : "") + simulationNodeClass(bar.node.id, available);
+  const title = `${bar.node.title}: ${bar.role}. Layers ${bar.startLayer + 1}-${bar.endLayer + 1}. ${bar.incoming} in, ${bar.outgoing} out.`;
   const difficulty = typeof bar.node.difficulty === "number" ? ` · D${bar.node.difficulty}` : "";
 
   return `
@@ -3558,6 +3991,7 @@ function renderPacingBar(bar: PacingBar) {
       title="${escapeAttribute(title)}"
       style="grid-column: ${bar.startLayer + 2} / ${bar.endLayer + 3}; grid-row: ${bar.track + 1}; --node-color: ${escapeAttribute(nodeColor(bar.node))};"
     >
+      ${completionCross(bar.node.id)}
       <span class="pacing-bar-title">${escapeHtml(bar.node.title)}</span>
       <span class="pacing-bar-meta">${escapeHtml(bar.role)} · ${bar.incoming} in · ${bar.outgoing} out${difficulty}</span>
     </button>
@@ -3571,7 +4005,7 @@ function buildPacingLanes(analysis: GraphAnalysis): PacingLane[] {
   groups.forEach((group) => {
     const laneNodes = group.nodeIds
       .map((nodeId) => getNode(nodeId))
-      .filter((node): node is PuzzleNode => node !== undefined && !assignedNodeIds.has(node.id));
+      .filter((node): node is PuzzleNode => node !== undefined && !assignedNodeIds.has(node.id) && (!focusNodeIds || focusNodeIds.has(node.id)));
 
     if (laneNodes.length === 0) {
       return;
@@ -3586,7 +4020,7 @@ function buildPacingLanes(analysis: GraphAnalysis): PacingLane[] {
     });
   });
 
-  const ungroupedNodes = nodes.filter((node) => !assignedNodeIds.has(node.id));
+  const ungroupedNodes = nodes.filter((node) => !assignedNodeIds.has(node.id) && (!focusNodeIds || focusNodeIds.has(node.id)));
 
   if (ungroupedNodes.length > 0) {
     lanes.push({
@@ -3612,7 +4046,7 @@ function buildPacingBars(analysis: GraphAnalysis, lanes: PacingLane[], layerCoun
           .filter((layer): layer is number => typeof layer === "number");
         const endLayer =
           childLayers.length > 0
-            ? Math.max(startLayer, ...childLayers)
+            ? Math.max(startLayer, maxOf(childLayers, startLayer))
             : Math.max(startLayer, layerCount - 1);
 
         return {
@@ -3623,7 +4057,7 @@ function buildPacingBars(analysis: GraphAnalysis, lanes: PacingLane[], layerCoun
           track: 0,
           incoming: incomingEdges(node.id).length,
           outgoing: outgoingEdges(node.id).length,
-          role: designRoleForNode(node, analysis),
+          role: designRoleForNode(node),
         };
       })
       .sort((a, b) => a.startLayer - b.startLayer || a.endLayer - b.endLayer || compareNodesByPosition(a.node, b.node));
@@ -3646,11 +4080,11 @@ function laneStartLayer(lane: PacingLane, analysis: GraphAnalysis) {
   return minOf(lane.nodes.map((node) => analysis.topology.layerByNode.get(node.id) ?? 0), 0);
 }
 
-function designRoleForNode(node: PuzzleNode, analysis: GraphAnalysis) {
+function designRoleForNode(node: PuzzleNode) {
   const incoming = incomingEdges(node.id).length;
   const outgoing = outgoingEdges(node.id).length;
-  const isRoot = analysis.roots.some((root) => root.id === node.id);
-  const isLeaf = analysis.leaves.some((leaf) => leaf.id === node.id);
+  const isRoot = incoming === 0;
+  const isLeaf = outgoing === 0;
 
   if (isLeaf && node.kind === "reward") {
     return "Reward";
@@ -3676,6 +4110,7 @@ function designRoleForNode(node: PuzzleNode, analysis: GraphAnalysis) {
 }
 
 function criticalPathForAnalysis(analysis: GraphAnalysis) {
+  if (analysis.topology.hasCycle) return [];
   if (nodes.length === 0) {
     return [];
   }
@@ -3688,7 +4123,7 @@ function criticalPathForAnalysis(analysis: GraphAnalysis) {
         nodeId: edge.from,
         length: bestByNode.get(edge.from)?.length ?? 0,
       }))
-      .sort((a, b) => b.length - a.length)[0];
+      .sort((a, b) => node.prerequisiteMode === "any" ? a.length - b.length : b.length - a.length)[0];
 
     bestByNode.set(node.id, {
       length: (bestParent?.length ?? 0) + 1,
@@ -3705,7 +4140,9 @@ function criticalPathForAnalysis(analysis: GraphAnalysis) {
   const path: PuzzleNode[] = [];
   let cursor: string | null = endNodeId;
 
-  while (cursor) {
+  const visited = new Set<string>();
+  while (cursor && !visited.has(cursor)) {
+    visited.add(cursor);
     const node = getNode(cursor);
 
     if (node) {
@@ -3910,6 +4347,13 @@ function renderInspector() {
         <label for="node-note">Memo</label>
         <textarea id="node-note">${escapeHtml(selectedNode.note)}</textarea>
       </div>
+      <div class="field-group"><label for="prerequisite-mode">Prerequisite rule</label>
+        <select id="prerequisite-mode"><option value="all" ${selectedNode.prerequisiteMode !== "any" ? "selected" : ""}>All prerequisites (AND)</option>
+        <option value="any" ${selectedNode.prerequisiteMode === "any" ? "selected" : ""}>Any prerequisite (OR)</option></select>
+      </div>
+      <div class="focus-actions"><button type="button" id="focus-upstream">Focus prerequisites</button>
+        <button type="button" id="focus-downstream">Focus unlocks</button></div>
+      ${simulationActive ? `<button type="button" id="simulation-node-action" ${!completedNodeIds.has(selectedNode.id) && !dependencyModel().canSolve(selectedNode.id, completedNodeIds) ? "disabled" : ""}>${completedNodeIds.has(selectedNode.id) ? "Undo completion" : "Mark solved"}</button>` : ""}
       <div class="relationship-list">
         <h3>Prerequisites</h3>
         <p>${escapeHtml(prerequisites || "Available at chart start.")}</p>
@@ -3917,6 +4361,11 @@ function renderInspector() {
         <p>${escapeHtml(unlocks || "No downstream puzzle yet.")}</p>
         <h3>Safe narrative context</h3>
         <p>${escapeHtml(safeFacts.length > 0 ? safeFacts.join(", ") : "Only always-known facts are guaranteed.")}</p>
+      </div>
+      <div class="field-group"><label for="narrative-reference">Narrative references</label>
+        <p class="field-help">Tag events this puzzle's writing assumes have happened.</p>
+        <select id="narrative-reference"><option value="">Choose an event…</option>${nodes.filter(node => node.id !== selectedNode.id && !selectedNode.narrativeReferences?.includes(node.id)).map(node => `<option value="${escapeAttribute(node.id)}">${escapeHtml(node.title)}</option>`).join("")}</select>
+        <div class="reference-list">${(selectedNode.narrativeReferences ?? []).map(id => `<button type="button" data-remove-reference="${escapeAttribute(id)}" title="Remove reference">${escapeHtml(getNode(id)?.title ?? id)} · ${dependencyModel().guaranteedAncestors(selectedNode.id).has(id) ? "guaranteed" : "not guaranteed"} ×</button>`).join("")}</div>
       </div>
       <button class="danger-button" id="delete-selection" type="button" title="Delete selected node">
         <i data-lucide="trash-2"></i>
@@ -4017,6 +4466,21 @@ function bindChartInspector() {
 }
 
 function bindNodeInspector(nodeId: string) {
+  must<HTMLSelectElement>("#prerequisite-mode").addEventListener("change", event => withGraphEdit(() => {
+    updateNode(nodeId, { prerequisiteMode: (event.target as HTMLSelectElement).value === "any" ? "any" : "all" }); render();
+  }));
+  for (const direction of ["upstream", "downstream"] as const) {
+    must<HTMLButtonElement>(`#focus-${direction}`).addEventListener("click", () => focusOnNodes([nodeId, ...dependencyModel().related(nodeId, direction)], nodeId));
+  }
+  document.querySelector("#simulation-node-action")?.addEventListener("click", () => toggleCompleted(nodeId));
+  must<HTMLSelectElement>("#narrative-reference").addEventListener("change", event => {
+    const id = (event.target as HTMLSelectElement).value;
+    if (id) withGraphEdit(() => { updateNode(nodeId, { narrativeReferences: [...getNode(nodeId)?.narrativeReferences ?? [], id] }); render(); });
+  });
+  inspector.querySelectorAll<HTMLButtonElement>("[data-remove-reference]").forEach(button => button.addEventListener("click", () => withGraphEdit(() => {
+    updateNode(nodeId, { narrativeReferences: getNode(nodeId)?.narrativeReferences?.filter(id => id !== button.dataset.removeReference) }); render();
+  })));
+
   const titleInput = must<HTMLInputElement>("#node-title");
   const kindSelect = must<HTMLSelectElement>("#node-kind");
   const colorInput = must<HTMLInputElement>("#node-color");
@@ -4030,8 +4494,7 @@ function bindNodeInspector(nodeId: string) {
 
   titleInput.addEventListener("input", (event) => {
     updateNode(nodeId, { title: (event.target as HTMLInputElement).value });
-    renderNodes();
-    renderEdges();
+    refreshDerivedViews();
   });
 
   kindSelect.addEventListener("change", (event) => {
@@ -4045,7 +4508,7 @@ function bindNodeInspector(nodeId: string) {
     const color = sanitizeColor((event.target as HTMLInputElement).value);
     updateNode(nodeId, { color });
     must<HTMLSpanElement>("#node-color-value").textContent = color.toUpperCase();
-    renderNodes();
+    refreshDerivedViews();
   });
 
   difficultyInput.addEventListener("input", (event) => {
@@ -4053,12 +4516,12 @@ function bindNodeInspector(nodeId: string) {
     const parsed = Number(value);
     const difficulty = value === "" || !Number.isFinite(parsed) ? undefined : clamp(parsed, 1, 5);
     updateNode(nodeId, { difficulty });
-    renderNodes();
+    refreshDerivedViews();
   });
 
   noteInput.addEventListener("input", (event) => {
     updateNode(nodeId, { note: (event.target as HTMLTextAreaElement).value });
-    renderNodes();
+    refreshDerivedViews();
   });
 
   must<HTMLButtonElement>("#delete-selection").addEventListener("click", () => {
@@ -4074,9 +4537,7 @@ function bindEdgeInspector(edgeId: string) {
 
   labelInput.addEventListener("input", (event) => {
     updateEdge(edgeId, { label: (event.target as HTMLInputElement).value });
-    markGraphvizRoutingDirty();
-    refreshGraphvizRoutingIfNeeded();
-    renderEdges();
+      renderEdges();
   });
 
   tokenSelect.addEventListener("change", (event) => {
@@ -4088,18 +4549,16 @@ function bindEdgeInspector(edgeId: string) {
     });
   });
 
-  inspector.querySelector<HTMLButtonElement>("#reset-edge-route")?.addEventListener("click", () => {
-    withGraphEdit(() => {
-      clearEdgeRouteOverride(edgeId);
-      render();
-    });
+  inspector.querySelector<HTMLButtonElement>("#reset-edge-route")?.addEventListener("click", async () => {
+    const session = documentSession;
+    const choice = await graphChoice("Reset this connector?", "Discard this connector's manual waypoints and return to automatic routing? You can undo it afterward.", [["cancel", "Cancel"], ["reset", "Reset route"]]);
+    if (choice === "reset" && session === documentSession) withGraphEdit(() => { clearEdgeRouteOverride(edgeId); render(); });
   });
 
-  inspector.querySelector<HTMLButtonElement>("#reset-edge-label")?.addEventListener("click", () => {
-    withGraphEdit(() => {
-      clearEdgeLabelOverride(edgeId);
-      render();
-    });
+  inspector.querySelector<HTMLButtonElement>("#reset-edge-label")?.addEventListener("click", async () => {
+    const session = documentSession;
+    const choice = await graphChoice("Reset label position?", "Return this label to its automatic position? You can undo it afterward.", [["cancel", "Cancel"], ["reset", "Reset label"]]);
+    if (choice === "reset" && session === documentSession) withGraphEdit(() => { clearEdgeLabelOverride(edgeId); render(); });
   });
 
   must<HTMLButtonElement>("#delete-selection").addEventListener("click", () => {
@@ -4117,6 +4576,7 @@ function bindGroupInspector(groupId: string) {
   nameInput.addEventListener("input", (event) => {
     updateGroup(groupId, { name: (event.target as HTMLInputElement).value });
     renderGroups();
+    refreshDerivedViews();
   });
 
   colorInput.addEventListener("input", (event) => {
@@ -4124,6 +4584,7 @@ function bindGroupInspector(groupId: string) {
     updateGroup(groupId, { color });
     must<HTMLSpanElement>("#group-color-value").textContent = color.toUpperCase();
     renderGroups();
+    refreshDerivedViews();
   });
 
   must<HTMLButtonElement>("#toggle-group-hidden").addEventListener("click", () => {
@@ -4318,17 +4779,11 @@ function handleGroupDragMove(event: PointerEvent) {
     ]),
   );
 
-  nodes = nodes.map((node) => {
-    const position = positionsByNodeId.get(node.id);
+  if (!applyDraggedPositions(positionsByNodeId)) return;
+  renderDraggedPositions(positionsByNodeId);
 
-    return position ? { ...node, ...position } : node;
-  });
-
-  renderGroups();
-  renderNodes();
-
-  if (groupDragState.originPositions.some((position) => isRoutedNode(position.nodeId))) {
-    scheduleRoutingRefresh();
+  if (visibleEdges().length > 0) {
+    scheduleEdgePreview();
   } else {
     renderEdges();
   }
@@ -4336,7 +4791,7 @@ function handleGroupDragMove(event: PointerEvent) {
 
 function finishGroupDrag() {
   groupDragState = null;
-  cancelScheduledRoutingRefresh();
+  cancelScheduledEdgePreview();
   window.removeEventListener("pointermove", handleGroupDragMove);
   render();
   commitGraphEdit();
@@ -4561,17 +5016,11 @@ function handleDragMove(event: PointerEvent) {
     ]),
   );
 
-  nodes = nodes.map((node) => {
-    const position = positionsByNodeId.get(node.id);
+  if (!applyDraggedPositions(positionsByNodeId)) return;
+  renderDraggedPositions(positionsByNodeId);
 
-    return position ? { ...node, ...position } : node;
-  });
-
-  renderGroups();
-  renderNodes();
-
-  if (dragState.nodeIds.some(isRoutedNode)) {
-    scheduleRoutingRefresh();
+  if (visibleEdges().length > 0) {
+    scheduleEdgePreview();
   } else {
     renderEdges();
   }
@@ -4579,22 +5028,27 @@ function handleDragMove(event: PointerEvent) {
 
 function finishDrag() {
   dragState = null;
-  cancelScheduledRoutingRefresh();
+  cancelScheduledEdgePreview();
   window.removeEventListener("pointermove", handleDragMove);
   render();
   commitGraphEdit();
 }
 
 function updateNode(nodeId: string, patch: Partial<PuzzleNode>) {
+  if (["x", "y", "width", "height"].some(key => key in patch)) invalidateAutomaticRoutes();
   nodes = nodes.map((node) => (node.id === nodeId ? { ...node, ...patch } : node));
+  noteGraphChanged();
 }
 
 function updateEdge(edgeId: string, patch: Partial<DependencyEdge>) {
+  if (["from", "to", "label", "manualRoute"].some(key => key in patch)) invalidateAutomaticRoutes();
   edges = edges.map((edge) => (edge.id === edgeId ? { ...edge, ...patch } : edge));
+  noteGraphChanged();
 }
 
 function updateGroup(groupId: string, patch: Partial<PuzzleGroup>) {
   groups = groups.map((group) => (group.id === groupId ? { ...group, ...patch } : group));
+  noteGraphChanged();
 }
 
 function updateChartMetadata(patch: { title?: string; description?: string }) {
@@ -4609,9 +5063,11 @@ function updateChartMetadata(patch: { title?: string; description?: string }) {
       ? { description: patch.description.trim() ? patch.description : undefined }
       : {}),
   };
+  noteGraphChanged();
 }
 
 function clearEdgeRouteOverride(edgeId: string) {
+  invalidateAutomaticRoutes();
   edges = edges.map((edge) => {
     if (edge.id !== edgeId) {
       return edge;
@@ -4636,7 +5092,8 @@ function clearEdgeLabelOverride(edgeId: string) {
 }
 
 function getEdge(edgeId: string) {
-  return edges.find((edge) => edge.id === edgeId);
+  ensureEdgeAdjacency();
+  return edgesById.get(edgeId);
 }
 
 function getGroup(groupId: string) {
@@ -4644,19 +5101,22 @@ function getGroup(groupId: string) {
 }
 
 function visibleNodes() {
-  return nodes.filter((node) => !isNodeHidden(node.id));
+  return nodes.filter((node) => !isNodeHidden(node.id) && (!focusNodeIds || focusNodeIds.has(node.id)));
 }
 
 function visibleEdges() {
-  return edges.filter((edge) => !isNodeHidden(edge.from) && !isNodeHidden(edge.to));
+  return edges.filter((edge) => !isNodeHidden(edge.from) && !isNodeHidden(edge.to) &&
+    (!focusNodeIds || (focusNodeIds.has(edge.from) && focusNodeIds.has(edge.to))));
 }
 
 function isNodeHidden(nodeId: string) {
+  if (focusNodeIds?.has(nodeId)) return false;
   return groups.some((group) => group.hidden && group.nodeIds.includes(nodeId));
 }
 
 function groupBounds(group: PuzzleGroup): Rect | null {
   const groupNodes = group.nodeIds
+    .filter((id) => !focusNodeIds || focusNodeIds.has(id))
     .map((nodeId) => getNode(nodeId))
     .filter((node): node is PuzzleNode => node !== undefined);
 
@@ -4683,86 +5143,120 @@ function groupBounds(group: PuzzleGroup): Rect | null {
   };
 }
 
-function getRoutedNodeIds(routeEdges = edges) {
-  const routedNodeIds = new Set<string>();
 
-  routeEdges.forEach((edge) => {
-    routedNodeIds.add(edge.from);
-    routedNodeIds.add(edge.to);
+function invalidateAutomaticRoutes(positionsOnly = false) {
+  automaticRoutesDirty = true;
+  routingRevision += 1;
+  if (!positionsOnly) routingContentRevision += 1;
+}
+
+function routingDragActive() {
+  // Moving boxes uses the same live router as release. Editing a manual
+  // connector must not start an automatic routing job underneath the gesture.
+  return !!edgeRouteDragState;
+}
+
+function refreshAutomaticRoutesIfNeeded() {
+  if (currentGraph && automaticRoutesDirty && !routingDragActive()) void ensureAutomaticRouting();
+}
+
+async function ensureAutomaticRouting(): Promise<void> {
+  if (automaticRoutingPromise) return automaticRoutingPromise;
+  if (!currentGraph || !automaticRoutesDirty || routingDragActive()) return;
+  automaticRoutingPromise = (async () => {
+    while (currentGraph && automaticRoutesDirty && !routingDragActive()) {
+      if (!edges.some(edge => !edge.manualRoute)) { automaticRoutesDirty = false; break; }
+      const session = documentSession;
+      const revision = routingRevision;
+      const contentRevision = routingContentRevision;
+      const engine = await initializeLayoutEngine();
+      if (!engine) { automaticRoutesDirty = false; break; }
+      if (session !== documentSession || revision !== routingRevision) continue;
+      const inputNodes = nodes.map(node => ({ ...node }));
+      const inputEdges = edges.map(edge => ({ ...edge }));
+      try {
+        const geometry = await engine.layout(inputNodes, inputEdges, "fixed");
+        // Coalesce pointer movements into one in-flight calculation. A result
+        // for an earlier position can refresh the live preview while the next
+        // position is calculated, but never crosses a file or content change.
+        if (session !== documentSession || contentRevision !== routingContentRevision) continue;
+        if (revision !== routingRevision && !dragState && !groupDragState) continue;
+        automaticRoutes = decorateRoutedLayout(geometry);
+        routingError = null;
+        automaticRoutesDirty = revision !== routingRevision;
+        resizeWorld(Math.max(world.width, automaticRoutes.width), Math.max(world.height, automaticRoutes.height));
+      } catch (error) {
+        if (session !== documentSession || revision !== routingRevision) continue;
+        routingError = error instanceof Error ? error.message : "Unable to route connections.";
+        automaticRoutesDirty = false;
+      }
+      renderEdges();
+      renderGroups();
+      renderWarnings(analyzeGraph());
+    }
+  })();
+  try { await automaticRoutingPromise; }
+  finally { automaticRoutingPromise = null; }
+}
+
+async function initializeLayoutEngine(): Promise<D2LayoutEngine | null> {
+  if (layoutEngine) return layoutEngine;
+  if (layoutEngineLoadPromise) return layoutEngineLoadPromise;
+  layoutEngineLoadPromise = (async () => {
+    try {
+      layoutEngine = await loadLayoutEngine();
+      return layoutEngine;
+    } catch (error) {
+      routingError = error instanceof Error ? error.message : "Unable to load the connection router.";
+      return null;
+    } finally { layoutEngineLoadPromise = null; }
+  })();
+  return layoutEngineLoadPromise;
+}
+
+// Paint port-preserving feedback immediately, then replace it with a D2 result
+// during the drag. Release reuses that result if the positions haven't changed.
+function scheduleEdgePreview() {
+  invalidateAutomaticRoutes(true);
+  if (edgePreviewHandle !== null) return;
+  edgePreviewHandle = window.requestAnimationFrame(() => {
+    edgePreviewHandle = null;
+    const movedIds = dragState?.nodeIds ?? groupDragState?.originPositions.map(position => position.nodeId) ?? [];
+    const affected = new Set(movedIds.flatMap(id => [...incomingEdges(id), ...outgoingEdges(id)].map(edge => edge.id)));
+    renderEdges(affected);
   });
-
-  return routedNodeIds;
 }
 
-function isRoutedNode(nodeId: string) {
-  return edges.some((edge) => edge.from === nodeId || edge.to === nodeId);
+function applyDraggedPositions(positions: Map<string, Point>) {
+  let moved = false;
+  nodes = nodes.map(node => {
+    const position = positions.get(node.id);
+    if (!position || (node.x === position.x && node.y === position.y)) return node;
+    moved = true;
+    return { ...node, ...position };
+  });
+  return moved;
 }
 
-async function initializeGraphviz() {
-  try {
-    graphviz = await Graphviz.load();
-    graphvizError = null;
-    refreshGraphvizRouting();
-    render();
-  } catch (error) {
-    graphviz = null;
-    graphvizLayout = null;
-    graphvizError = error instanceof Error ? error.message : "Unknown Graphviz load failure";
-    render();
-  }
-}
-
-function markGraphvizRoutingDirty() {
-  graphvizRoutingDirty = true;
-}
-
-function refreshGraphvizRoutingIfNeeded() {
-  if (!graphvizRoutingDirty) {
-    return;
-  }
-
-  refreshGraphvizRouting();
-}
-
-function refreshGraphvizRouting() {
-  if (!graphviz) {
-    return;
-  }
-
-  try {
-    graphvizLayout = computeGraphvizLayout("fixed");
-    graphvizError = null;
-  } catch (error) {
-    graphvizLayout = null;
-    graphvizError = error instanceof Error ? error.message : "Unknown routing failure";
-  } finally {
-    graphvizRoutingDirty = false;
-  }
-}
-
-// During a drag we get a pointermove per frame (or faster). Re-running the
-// Graphviz WASM layout synchronously on each one is the dominant cost, so we
-// coalesce it to at most one layout per animation frame and re-render the edges
-// once it lands. Nodes/edges are repainted immediately by the caller so the drag
-// still feels live; only the orthogonal re-routing is deferred.
-function scheduleRoutingRefresh() {
-  markGraphvizRoutingDirty();
-
-  if (routingRefreshHandle !== null) {
-    return;
-  }
-
-  routingRefreshHandle = window.requestAnimationFrame(() => {
-    routingRefreshHandle = null;
-    refreshGraphvizRoutingIfNeeded();
-    renderEdges();
+function renderDraggedPositions(positions: Map<string, Point>) {
+  nodeLayer.querySelectorAll<HTMLElement>(".node").forEach(element => {
+    const point = positions.get(element.dataset.nodeId ?? "");
+    if (point) { element.style.left = `${point.x}px`; element.style.top = `${point.y}px`; }
+  });
+  groupLayer.querySelectorAll<HTMLElement>(".group-box").forEach(element => {
+    const group = getGroup(element.dataset.groupId ?? "");
+    if (!group?.nodeIds.some(id => positions.has(id))) return;
+    const bounds = groupBounds(group);
+    if (!bounds) return;
+    Object.assign(element.style, { left: `${bounds.left}px`, top: `${bounds.top}px`,
+      width: `${bounds.right-bounds.left}px`, height: `${bounds.bottom-bounds.top}px` });
   });
 }
 
-function cancelScheduledRoutingRefresh() {
-  if (routingRefreshHandle !== null) {
-    window.cancelAnimationFrame(routingRefreshHandle);
-    routingRefreshHandle = null;
+function cancelScheduledEdgePreview() {
+  if (edgePreviewHandle !== null) {
+    window.cancelAnimationFrame(edgePreviewHandle);
+    edgePreviewHandle = null;
   }
 }
 
@@ -4786,179 +5280,51 @@ function measureEdgeLabel(label: string) {
   };
 }
 
-function widestEdgeLabelWidth() {
-  if (edges.length === 0) {
-    return EDGE_LABEL_MIN_WIDTH;
-  }
-
-  return maxOf(edges.map((edge) => measureEdgeLabel(edge.label).width), EDGE_LABEL_MIN_WIDTH);
+async function computeRoutedLayout(mode: LayoutMode): Promise<RoutedLayout> {
+  if (!layoutEngine) throw new Error("The connection router is not loaded.");
+  const geometry = await layoutEngine.layout(nodes.map(node => ({ ...node })), edges.map(edge => ({ ...edge })), mode);
+  const layout = decorateRoutedLayout(geometry);
+  if (mode === "fixed") return layout;
+  const left = minOf([...layout.nodes.values()].map(node => node.x), 0);
+  const top = minOf([...layout.nodes.values()].map(node => node.y), 0);
+  return translateRoutedLayout(layout, { x: 64 - left, y: 64 - top });
 }
 
-function computeGraphvizLayout(mode: "auto" | "fixed"): GraphvizLayout {
-  if (!graphviz) {
-    throw new Error("Graphviz is not loaded");
-  }
-
-  const dot = buildGraphvizDot(mode);
-  const output = graphviz.layout(dot, "json", mode === "auto" ? "dot" : "nop2", {
-    yInvert: mode === "auto",
+function decorateRoutedLayout(geometry: LayoutGeometry): RoutedLayout {
+  const parsedNodes = new Map<string, RoutedNodeLayout>();
+  const parsedEdges = new Map<string, RoutedEdgeLayout>();
+  const edgeGeometries: Array<{ edgeId: string; pathPoints: Point[]; arrowPoints: Point[]; labelPoint: Point }> = [];
+  geometry.nodes.forEach(node => parsedNodes.set(node.id, {
+    ...node, center: { x: node.x + node.width / 2, y: node.y + node.height / 2 },
+  }));
+  geometry.edges.forEach((points, edgeId) => {
+    const pathPoints = compactRoutePoints(points);
+    edgeGeometries.push({ edgeId, pathPoints, arrowPoints: arrowForRoute(pathPoints), labelPoint: pointAtPolylinePosition(pathPoints, 0.5) });
   });
-  const parsed = JSON.parse(output) as GraphvizJson;
-  const raw = parseGraphvizJson(parsed);
-
-  if (mode === "auto") {
-    return translateGraphvizLayout(raw, { x: 64, y: 64 });
-  }
-
-  const offset = averageFixedLayoutOffset(raw);
-  return translateGraphvizLayout(raw, offset);
-}
-
-function buildGraphvizDot(mode: "auto" | "fixed") {
-  const widestLabel = widestEdgeLabelWidth();
-  const topology = getTopology();
-  const widestLayer = Math.max(1, ...topology.layers.map((layer) => layer.length));
-  const edgeDensity = nodes.length > 0 ? edges.length / nodes.length : 0;
-  const autoNodeSep = round(
-    clamp(MIN_AUTO_NODESEP + Math.max(0, widestLayer - 4) * 0.11 + edgeDensity * 0.18, MIN_AUTO_NODESEP, 3),
-  );
-  const autoRankSep = round(clamp(Math.max(MIN_AUTO_RANKSEP, (widestLabel + EDGE_LABEL_SIDE_GUTTER) / 96), MIN_AUTO_RANKSEP, 4.8));
-  const graphAttrs =
-    mode === "auto"
-      ? [
-          `rankdir="LR"`,
-          `splines="ortho"`,
-          `outputorder="edgesfirst"`,
-          `forcelabels="true"`,
-          `mclimit="2"`,
-          `remincross="true"`,
-          `searchsize="500"`,
-          `nodesep="${autoNodeSep}"`,
-          `ranksep="${autoRankSep}"`,
-          `pad="0.35"`,
-          `margin="0"`,
-        ]
-      : [`splines="ortho"`, `outputorder="edgesfirst"`, `pad="0.35"`, `margin="0"`];
-
-  const graphvizEdges = mode === "fixed" ? visibleEdges() : edges;
-  const routedNodeIds = mode === "fixed" ? getRoutedNodeIds(graphvizEdges) : new Set(nodes.map((node) => node.id));
-  const graphvizNodes = nodes.filter((node) => routedNodeIds.has(node.id));
-  const nodeLines = graphvizNodes
-    .map((node) => {
-      const attrs = [
-        `label=""`,
-        `shape="box"`,
-        `fixedsize="true"`,
-        `width="${round(node.width / GRAPHVIZ_POINTS_PER_INCH)}"`,
-        `height="${round(node.height / GRAPHVIZ_POINTS_PER_INCH)}"`,
-        `margin="0"`,
-      ];
-
-      if (mode === "fixed") {
-        attrs.push(`pos="${round(node.x + node.width / 2)},${round(node.y + node.height / 2)}!"`);
-      }
-
-      return `  ${dotId(node.id)} [${attrs.join(", ")}];`;
-    })
-    .join("\n");
-
-  const edgeLines = graphvizEdges
-    .map((edge) => {
-      const attrs = [
-        `edgeId=${dotId(edge.id)}`,
-        `label=""`,
-        `arrowsize="0.7"`,
-        `penwidth="1.8"`,
-        `fontsize="12"`,
-        `fontname="Inter"`,
-      ];
-
-      return `  ${dotId(edge.from)} -> ${dotId(edge.to)} [${attrs.join(", ")}];`;
-    })
-    .join("\n");
-
-  return `digraph DepDoodle {
-  graph [${graphAttrs.join(", ")}];
-  node [shape="box", fixedsize="true", margin="0"];
-  edge [color="#5f7780", fontcolor="#485059"];
-${nodeLines}
-${edgeLines}
-}`;
-}
-
-function parseGraphvizJson(json: GraphvizJson): GraphvizLayout {
-  const nodesById = new Map<string, PuzzleNode>(nodes.map((node) => [node.id, node]));
-  const graphSize = parseGraphvizBounds(json.bb);
-  const parsedNodes = new Map<string, GraphvizNodeLayout>();
-  const parsedEdges = new Map<string, GraphvizEdgeLayout>();
-  const edgeGeometries: Array<{
-    edgeId: string;
-    pathPoints: Point[];
-    arrowPoints: Point[];
-    labelPoint: Point;
-  }> = [];
-
-  for (const object of json.objects ?? []) {
-    const node = nodesById.get(object.name);
-    const center = object.pos ? parseGraphvizPoint(object.pos) : null;
-
-    if (!node || !center) {
-      continue;
-    }
-
-    parsedNodes.set(node.id, {
-      center,
-      x: center.x - node.width / 2,
-      y: center.y - node.height / 2,
-      width: node.width,
-      height: node.height,
-    });
-  }
-
-  for (const graphvizEdge of json.edges ?? []) {
-    const edgeId = graphvizEdge.edgeId;
-
-    if (!edgeId) {
-      continue;
-    }
-
-    const pathPoints = findDrawPoints(graphvizEdge._draw_, "b");
-    const arrowPoints = findDrawPoints(graphvizEdge._hdraw_, "P");
-
-    if (!pathPoints || pathPoints.length === 0) {
-      continue;
-    }
-
-    edgeGeometries.push({
-      edgeId,
-      pathPoints,
-      arrowPoints: arrowPoints ?? [],
-      labelPoint: midpoint(pathPoints),
-    });
-  }
-
-  const edgeObstacleRectsByEdge = new Map(
-    edgeGeometries.map((geometry) => [geometry.edgeId, edgePathObstacleRects(geometry.pathPoints)]),
-  );
-  const placedLabelRects: Rect[] = [];
-
+  const nodeObstacles = new RectangleIndex<{ rect: Rect }>();
+  parsedNodes.forEach(node => nodeObstacles.add({ rect: inflateRect({ left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height }, 10) }));
+  const labelObstacles = new RectangleIndex<{ rect: Rect }>();
+  const obstacleIndex = new RectangleIndex<{ edgeId: string; rect: Rect }>();
+  edgeGeometries.forEach(geometry => edgePathObstacleRects(geometry.pathPoints).forEach(rect => obstacleIndex.add({ edgeId: geometry.edgeId, rect })));
   for (const geometry of edgeGeometries) {
-    const otherEdgeObstacleRects = edgeGeometries
-      .filter((candidate) => candidate.edgeId !== geometry.edgeId)
-      .flatMap((candidate) => edgeObstacleRectsByEdge.get(candidate.edgeId) ?? []);
+    const source = getEdge(geometry.edgeId);
+    const hasLabel = !!source?.label.trim();
+    const bounds = inflateRect({ left: minOf(geometry.pathPoints.map(p => p.x), 0), top: minOf(geometry.pathPoints.map(p => p.y), 0),
+      right: maxOf(geometry.pathPoints.map(p => p.x), 0), bottom: maxOf(geometry.pathPoints.map(p => p.y), 0) }, EDGE_LABEL_MAX_WIDTH);
+    const otherEdgeObstacleRects = hasLabel ? obstacleIndex.query(bounds).filter(item => item.edgeId !== geometry.edgeId).map(item => item.rect) : [];
     const labelPoint = fitLabelPoint(
       geometry.edgeId,
       geometry.labelPoint,
       geometry.pathPoints,
-      parsedNodes,
+      hasLabel ? nodeObstacles.query(bounds).map(item => item.rect) : [],
       otherEdgeObstacleRects,
-      placedLabelRects,
+      hasLabel ? labelObstacles.query(bounds).map(item => item.rect) : [],
     );
     const sourceEdge = edges.find((edge) => edge.id === geometry.edgeId);
     const label = sourceEdge?.label.trim() ?? "";
 
     if (label) {
-      placedLabelRects.push(inflateRect(labelRect(labelPoint, measureEdgeLabel(label)), EDGE_LABEL_CLEARANCE));
+      labelObstacles.add({ rect: inflateRect(labelRect(labelPoint, measureEdgeLabel(label)), EDGE_LABEL_CLEARANCE) });
     }
 
     parsedEdges.set(geometry.edgeId, {
@@ -4970,8 +5336,7 @@ function parseGraphvizJson(json: GraphvizJson): GraphvizLayout {
   }
 
   return {
-    width: graphSize.width,
-    height: graphSize.height,
+    ...measureWorldSize(parsedNodes, parsedEdges),
     nodes: parsedNodes,
     edges: parsedEdges,
   };
@@ -4981,7 +5346,7 @@ function fitLabelPoint(
   edgeId: string,
   defaultPoint: Point,
   pathPoints: Point[],
-  layoutNodes: Map<string, GraphvizNodeLayout>,
+  nodeRects: Rect[],
   edgeObstacleRects: Rect[],
   placedLabelRects: Rect[],
 ) {
@@ -4993,17 +5358,6 @@ function fitLabelPoint(
     return defaultPoint;
   }
 
-  const nodeRects = [...layoutNodes.values()].map((node) =>
-    inflateRect(
-      {
-        left: node.x,
-        top: node.y,
-        right: node.x + node.width,
-        bottom: node.y + node.height,
-      },
-      10,
-    ),
-  );
   const pathCandidates = labelPathCandidates(pathPoints);
   const anchorPoint = midpoint(pathCandidates);
 
@@ -5089,7 +5443,6 @@ function edgePathObstacleRects(pathPoints: Point[]) {
 }
 
 function edgeLabelAttachmentReport() {
-  refreshGraphvizRoutingIfNeeded();
 
   return edges
     .filter((edge) => edge.label.trim())
@@ -5147,9 +5500,9 @@ function intersectionArea(a: Rect, b: Rect) {
   return width * height;
 }
 
-function translateGraphvizLayout(layout: GraphvizLayout, offset: Point): GraphvizLayout {
-  const translatedNodes = new Map<string, GraphvizNodeLayout>();
-  const translatedEdges = new Map<string, GraphvizEdgeLayout>();
+function translateRoutedLayout(layout: RoutedLayout, offset: Point): RoutedLayout {
+  const translatedNodes = new Map<string, RoutedNodeLayout>();
+  const translatedEdges = new Map<string, RoutedEdgeLayout>();
 
   for (const [nodeId, node] of layout.nodes) {
     translatedNodes.set(nodeId, {
@@ -5170,8 +5523,6 @@ function translateGraphvizLayout(layout: GraphvizLayout, offset: Point): Graphvi
   }
 
   const measured = measureWorldSize(translatedNodes, translatedEdges);
-  resizeWorld(measured.width, measured.height);
-
   return {
     width: measured.width,
     height: measured.height,
@@ -5180,35 +5531,9 @@ function translateGraphvizLayout(layout: GraphvizLayout, offset: Point): Graphvi
   };
 }
 
-function averageFixedLayoutOffset(layout: GraphvizLayout): Point {
-  const deltas = [...layout.nodes.entries()]
-    .map(([nodeId, nodeLayout]) => {
-      const node = getNode(nodeId);
-
-      if (!node) {
-        return null;
-      }
-
-      return {
-        x: node.x + node.width / 2 - nodeLayout.center.x,
-        y: node.y + node.height / 2 - nodeLayout.center.y,
-      };
-    })
-    .filter((delta): delta is Point => delta !== null);
-
-  if (deltas.length === 0) {
-    return { x: 0, y: 0 };
-  }
-
-  return {
-    x: deltas.reduce((sum, delta) => sum + delta.x, 0) / deltas.length,
-    y: deltas.reduce((sum, delta) => sum + delta.y, 0) / deltas.length,
-  };
-}
-
 function measureWorldSize(
-  layoutNodes: Map<string, GraphvizNodeLayout>,
-  layoutEdges: Map<string, GraphvizEdgeLayout>,
+  layoutNodes: Map<string, RoutedNodeLayout>,
+  layoutEdges: Map<string, RoutedEdgeLayout>,
 ) {
   const xs: number[] = [1680];
   const ys: number[] = [1040];
@@ -5285,6 +5610,7 @@ function applyZoom() {
   graphViewport.style.width = `${Math.ceil(world.width * zoom)}px`;
   graphViewport.style.height = `${Math.ceil(world.height * zoom)}px`;
   graphSpace.style.transform = `scale(${zoom})`;
+  graphSpace.style.setProperty("--graph-emphasis-scale", String(Math.min(6, Math.max(1, 1 / zoom))));
   zoomLevel.textContent = `${Math.round(zoom * 100)}%`;
   zoomOutButton.disabled = zoom <= MIN_ZOOM + 0.001;
   zoomInButton.disabled = zoom >= MAX_ZOOM - 0.001;
@@ -5301,38 +5627,6 @@ function resizeWorld(width: number, height: number) {
   edgeLayer.setAttribute("width", `${world.width}`);
   edgeLayer.setAttribute("height", `${world.height}`);
   edgeLayer.setAttribute("viewBox", `0 0 ${world.width} ${world.height}`);
-}
-
-function findDrawPoints(ops: GraphvizDrawOp[] | undefined, op: string) {
-  const drawOp = ops?.find((candidate) => candidate.op === op && candidate.points);
-
-  if (!drawOp?.points) {
-    return null;
-  }
-
-  return drawOp.points.map(([x, y]) => ({ x, y }));
-}
-
-function parseGraphvizBounds(bounds: string | undefined) {
-  if (!bounds) {
-    return { width: world.width, height: world.height };
-  }
-
-  const [x1, y1, x2, y2] = bounds.split(",").map(Number);
-
-  return {
-    width: Math.abs((x2 ?? world.width) - (x1 ?? 0)),
-    height: Math.abs((y2 ?? world.height) - (y1 ?? 0)),
-  };
-}
-
-function parseGraphvizPoint(value: string): Point {
-  const [x, y] = value.split(",").map(Number);
-
-  return {
-    x: x ?? 0,
-    y: y ?? 0,
-  };
 }
 
 function midpoint(points: Point[]): Point {
@@ -5415,9 +5709,6 @@ function translatePath(path: string, offset: Point) {
   });
 }
 
-function dotId(value: string) {
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`;
-}
 
 function analyzeGraph(): GraphAnalysis {
   const topology = getTopology();
@@ -5448,8 +5739,8 @@ function analyzeGraph(): GraphAnalysis {
     warnings.push("No closers yet. Consider where branches intentionally collapse.");
   }
 
-  if (graphvizError) {
-    warnings.push(`Graphviz routing error: ${graphvizError}`);
+  if (routingError) {
+    warnings.push(`Connection routing error: ${routingError}`);
   }
 
   return {
@@ -5462,7 +5753,18 @@ function analyzeGraph(): GraphAnalysis {
   };
 }
 
+let topologyNodes: PuzzleNode[] | null = null;
+let topologyEdges: DependencyEdge[] | null = null;
+let cachedTopology: Topology;
 function getTopology(): Topology {
+  if (topologyNodes !== nodes || topologyEdges !== edges) {
+    cachedTopology = computeTopology();
+    topologyNodes = nodes; topologyEdges = edges;
+  }
+  return cachedTopology;
+}
+
+function computeTopology(): Topology {
   const inDegree = new Map<string, number>();
   const children = new Map<string, string[]>();
 
@@ -5523,7 +5825,7 @@ function getTopology(): Topology {
     const parentLayers = incomingEdges(node.id)
       .map((edge) => layerByNode.get(edge.from))
       .filter((layer): layer is number => typeof layer === "number");
-    const layer = parentLayers.length === 0 ? 0 : maxOf(parentLayers, 0) + 1;
+    const layer = parentLayers.length === 0 ? 0 : (node.prerequisiteMode === "any" ? minOf(parentLayers, 0) : maxOf(parentLayers, 0)) + 1;
     layerByNode.set(node.id, layer);
   });
 
@@ -5547,29 +5849,18 @@ function getTopology(): Topology {
   };
 }
 
-function getAncestors(nodeId: string) {
-  const visited = new Set<string>();
-  const result: PuzzleNode[] = [];
-  const stack = incomingEdges(nodeId).map((edge) => edge.from);
-
-  while (stack.length > 0) {
-    const currentId = stack.pop();
-
-    if (!currentId || visited.has(currentId)) {
-      continue;
-    }
-
-    visited.add(currentId);
-    const node = getNode(currentId);
-
-    if (node) {
-      result.push(node);
-    }
-
-    incomingEdges(currentId).forEach((edge) => stack.push(edge.from));
+function dependencyModel() {
+  if (modelNodes !== nodes || modelEdges !== edges) {
+    cachedModel = new DependencyModel(nodes, edges);
+    modelNodes = nodes;
+    modelEdges = edges;
   }
+  return cachedModel;
+}
 
-  return result.sort(compareNodesByPosition);
+function getAncestors(nodeId: string) {
+  return [...dependencyModel().guaranteedAncestors(nodeId)]
+    .map(id => getNode(id)).filter((node): node is PuzzleNode => !!node).sort(compareNodesByPosition);
 }
 
 // Graph lookups are memoized on the identity of the `nodes`/`edges` arrays.
@@ -5584,6 +5875,7 @@ let nodeIndexValue = new Map<string, PuzzleNode>();
 let edgeAdjacencySource: DependencyEdge[] | null = null;
 let incomingEdgeMap = new Map<string, DependencyEdge[]>();
 let outgoingEdgeMap = new Map<string, DependencyEdge[]>();
+let edgesById = new Map<string, DependencyEdge>();
 
 function nodeIndex() {
   if (nodeIndexSource !== nodes) {
@@ -5601,8 +5893,10 @@ function ensureEdgeAdjacency() {
 
   incomingEdgeMap = new Map();
   outgoingEdgeMap = new Map();
+  edgesById = new Map();
 
   for (const edge of edges) {
+    edgesById.set(edge.id, edge);
     const outgoing = outgoingEdgeMap.get(edge.from);
     if (outgoing) {
       outgoing.push(edge);
@@ -5779,6 +6073,9 @@ function normalizeGraphNode(value: unknown): PuzzleNode {
     kind,
     color: sanitizeColor(stringValue(record.color, defaultNodeColor(kind))),
     difficulty,
+    prerequisiteMode: record.prerequisiteMode === "any" ? "any" : "all",
+    narrativeReferences: Array.isArray(record.narrativeReferences)
+      ? [...new Set(record.narrativeReferences.filter((id): id is string => typeof id === "string" && id.length > 0))] : [],
     x: finiteNumber(record.x, 80),
     y: finiteNumber(record.y, 80),
     width: clamp(finiteNumber(record.width, 220), 160, 420),
@@ -6221,13 +6518,6 @@ function cloneGroup(group: PuzzleGroup): PuzzleGroup {
   };
 }
 
-function clearEdgeLayoutOverrides(edge: DependencyEdge): DependencyEdge {
-  const next = { ...edge };
-  delete next.manualRoute;
-  delete next.manualLabelPosition;
-
-  return next;
-}
 
 // When a file path is known it is the stable identity for a recent entry, so
 // editing the chart title (or re-saving) updates the existing entry instead of
@@ -6237,10 +6527,13 @@ function recentGraphId(title: string, sourceName: string, filePath?: string) {
   return (filePath && filePath.trim() ? filePath : `${sourceName}::${title}`).toLowerCase();
 }
 
-function measureGraphBounds(graphNodes: PuzzleNode[]) {
+function measureGraphBounds(graphNodes: PuzzleNode[], graphEdges: DependencyEdge[] = []) {
+  const xs = graphNodes.map(node => node.x + node.width + 220);
+  const ys = graphNodes.map(node => node.y + node.height + 220);
+  graphEdges.forEach(edge => edge.manualRoute?.forEach(point => { xs.push(point.x + 220); ys.push(point.y + 220); }));
   return {
-    width: Math.ceil(maxOf(graphNodes.map((node) => node.x + node.width + 220), EMPTY_GRAPH_WORLD.width)),
-    height: Math.ceil(maxOf(graphNodes.map((node) => node.y + node.height + 220), EMPTY_GRAPH_WORLD.height)),
+    width: Math.ceil(maxOf(xs, EMPTY_GRAPH_WORLD.width)),
+    height: Math.ceil(maxOf(ys, EMPTY_GRAPH_WORLD.height)),
   };
 }
 
@@ -6307,7 +6600,7 @@ function optionalPointArray(value: unknown) {
     })
     .filter((point): point is Point => point !== null);
 
-  return points.length >= 2 ? simplifyRoutePoints(manhattanizeRoutePoints(compactRoutePoints(points))) : undefined;
+  return points.length >= 2 ? points : undefined;
 }
 
 function optionalDifficulty(value: unknown) {
@@ -6507,26 +6800,91 @@ function installDebugApi() {
 
   window.__depdoodleDebug = {
     autoLayout: async () => {
-      await autoArrange({ confirm: false });
+      await autoArrange();
     },
     labelAttachmentReport: edgeLabelAttachmentReport,
     loadGraph: (document) => {
       openGraphDocument(document, "Debug graph", false);
     },
-    waitForGraphviz: async () => {
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if (graphviz || graphvizError) {
-          return;
-        }
-
-        await new Promise((resolve) => window.setTimeout(resolve, 50));
-      }
-
-      throw new Error("Graphviz did not finish loading.");
+    waitForRouting: async () => {
+      if (!(await initializeLayoutEngine())) throw new Error(routingError ?? "Unable to load the connection router.");
+      await ensureAutomaticRouting();
     },
   };
 }
 
+edgeLayer.addEventListener("pointerdown", event => {
+  const target = (event.target as Element).closest<SVGElement>(".edge-pick");
+  const id = target?.dataset.edgeId;
+  if (!id) return;
+  event.stopPropagation();
+  if (target.classList.contains("edge-label-pick")) beginEdgeLabelDrag(event, id);
+  else beginEdgeRouteDrag(event, id);
+});
+
+must<HTMLButtonElement>("#reroute-graph").addEventListener("click", () => { void rerouteConnections(); });
+
+must<HTMLInputElement>("#node-search").addEventListener("input", renderExplorer);
+must<HTMLElement>("#search-results").addEventListener("click", event => {
+  const target = (event.target as Element).closest<HTMLButtonElement>("[data-search-node]");
+  if (target?.dataset.searchNode) inspectNodes([target.dataset.searchNode], target.dataset.searchNode);
+});
+must<HTMLButtonElement>("#clear-focus").addEventListener("click", clearFocus);
+must<HTMLButtonElement>("[data-clear-focus]").addEventListener("click", clearFocus);
+must<HTMLInputElement>("#simulate-toggle").addEventListener("change", event => { simulationActive = (event.target as HTMLInputElement).checked; render(); });
+must<HTMLElement>("#simulation-panel").addEventListener("click", event => {
+  const target = (event.target as Element).closest<HTMLButtonElement>("button");
+  if (target?.dataset.solve) toggleCompleted(target.dataset.solve);
+  if (target?.id === "reset-simulation") { completedNodeIds.clear(); render(); }
+});
+pacingBoard.addEventListener("pointerover", event => {
+  const target = (event.target as Element).closest<HTMLButtonElement>(".pacing-bar");
+  if (target?.dataset.nodeId && !target.dataset.hasSafeCount) {
+    target.title += ` Safe facts: ${getAncestors(target.dataset.nodeId).length}.`;
+    target.dataset.hasSafeCount = "true";
+  }
+});
+pacingBoard.addEventListener("focusin", event => {
+  const target = (event.target as Element).closest<HTMLButtonElement>(".pacing-bar");
+  if (target?.dataset.nodeId && !target.dataset.hasSafeCount) {
+    target.title += ` Safe facts: ${getAncestors(target.dataset.nodeId).length}.`;
+    target.dataset.hasSafeCount = "true";
+  }
+});
+
+must<HTMLButtonElement>("#recover-draft").addEventListener("click", openRecoveryDraft);
+
+window.addEventListener("beforeunload", (event) => {
+  if (!hasUnsavedChanges() || nativeCloseApproved) return;
+  persistRecovery();
+  if (!isTauriRuntime()) { event.preventDefault(); event.returnValue = ""; }
+});
+async function handleNativeCloseRequest(event: { preventDefault: () => void }) {
+  // Tauri awaits this handler and destroys the window unless it is cancelled.
+  // Requesting close again here re-enters this same event path.
+  if (closeDecisionPending) { event.preventDefault(); return; }
+  if (!hasUnsavedChanges()) { nativeCloseApproved = true; return; }
+  closeDecisionPending = true;
+  try {
+    if (!(await confirmLeaveGraph())) {
+      nativeCloseApproved = false;
+      event.preventDefault();
+      return;
+    }
+    nativeCloseApproved = true;
+    clearRecovery();
+  } catch (error) {
+    nativeCloseApproved = false;
+    event.preventDefault();
+    window.alert(error instanceof Error ? error.message : "Unable to close the graph safely.");
+  } finally { closeDecisionPending = false; }
+}
+
+if (isTauriRuntime()) {
+  void getCurrentWindow().onCloseRequested(handleNativeCloseRequest);
+}
+
 render();
 installDebugApi();
-initializeGraphviz();
+
+export { openGraphDocument, analyzeGraph, criticalPathForAnalysis, createGraphDocument, saveGraph, renderGraphToCanvas, handleNativeCloseRequest, ensureAutomaticRouting };

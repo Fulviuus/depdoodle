@@ -463,13 +463,23 @@ button {
 }
 
 .welcome-logo {
-  display: block;
   width: min(540px, 100%);
-  height: auto;
   margin: 0 0 28px;
-  padding: 10px;
-  border-radius: 14px;
-  background: #ffffff;
+}
+
+.welcome-logo img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.welcome-logo .welcome-logo-dark,
+:root[data-theme="dark"] .welcome-logo-light {
+  display: none;
+}
+
+:root[data-theme="dark"] .welcome-logo-dark {
+  display: block;
 }
 
 .welcome-main h1 {
@@ -1573,4 +1583,147 @@ button {
   .recent-sidebar {
     min-height: auto;
   }
+}
+
+#save-status { margin-left: auto; padding-right: 12px; font-size: 12px; color: var(--md-on-surface-variant); }
+.save-dialog { max-width: 460px; border: 1px solid var(--md-outline); border-radius: 16px; padding: 24px; background: var(--md-surface); color: var(--md-on-surface); }
+.save-dialog::backdrop { background: #0008; }
+.dialog-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px; }
+.dialog-actions button { padding: 10px 14px; border-radius: 8px; }
+
+.explorer input { width: 100%; margin: 8px 0; }
+.search-results, .simulation-list, .reference-list, .focus-actions { display: flex; flex-direction: column; gap: 6px; }
+.search-results button, .simulation-list button, .reference-list button, .focus-actions button, #simulation-node-action, #reset-simulation { border: 1px solid var(--md-outline-variant); border-radius: 8px; padding: 8px 10px; background: var(--md-surface-container); color: var(--md-on-surface); text-align: left; }
+.simulation-toggle { display: flex; align-items: center; gap: 8px; }
+#simulation-panel, .field-help { font-size: 12px; color: var(--md-on-surface-variant); }
+.diagnostic {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  border: 1px solid var(--md-warning-outline);
+  text-align: left;
+  cursor: pointer;
+}
+.diagnostic:hover { filter: brightness(0.97); }
+.diagnostic-indicator {
+  display: grid;
+  place-items: center;
+  flex: 0 0 18px;
+  height: 18px;
+  border: 1.5px solid currentColor;
+  border-radius: 4px;
+}
+.diagnostic[aria-pressed="true"] {
+  border-color: var(--md-primary);
+  color: var(--md-on-primary-container);
+  background: var(--md-primary-container);
+  box-shadow: 0 0 0 2px var(--node-selected-ring), 0 0 14px var(--node-selected-ring);
+}
+.diagnostic[aria-pressed="true"] .diagnostic-indicator {
+  border-color: var(--md-primary);
+  color: var(--md-on-primary);
+  background: var(--md-primary);
+}
+.diagnostic[aria-pressed="true"] .diagnostic-indicator::after { content: "✓"; font-weight: 800; }
+.node.check-dimmed, .edge-group.check-dimmed, .group-box.check-dimmed, .pacing-bar.check-dimmed {
+  opacity: 0.2;
+}
+.node.check-highlighted, .pacing-bar.check-highlighted {
+  opacity: 1;
+  border-color: var(--md-primary);
+  outline: calc(2px * var(--graph-emphasis-scale, 1)) solid var(--md-primary);
+  outline-offset: calc(2px * var(--graph-emphasis-scale, 1));
+  box-shadow: 0 0 0 calc(6px * var(--graph-emphasis-scale, 1)) var(--node-selected-ring),
+    0 0 calc(24px * var(--graph-emphasis-scale, 1)) calc(8px * var(--graph-emphasis-scale, 1)) var(--node-selected-ring), var(--md-elevation-2);
+}
+.node.check-highlighted { z-index: 1; }
+.edge-group.check-highlighted {
+  opacity: 1;
+  filter: drop-shadow(0 0 calc(5px * var(--graph-emphasis-scale, 1)) var(--md-primary));
+}
+.edge-group.check-highlighted .edge-path { stroke: var(--md-primary); stroke-width: calc(3.5px * var(--graph-emphasis-scale, 1)); }
+.edge-group.check-highlighted .edge-arrow { fill: var(--md-primary); }
+.reference-list { margin-top: 8px; }
+
+.explorer input { min-height: 38px; border: 1px solid var(--md-outline); border-radius: 8px; padding: 8px 10px; background: var(--md-surface-container-lowest); color: var(--md-on-surface); font: inherit; font-size: 13px; }
+
+.focus-banner { position: absolute; z-index: 4; top: 32px; left: 32px; display: flex; align-items: center; gap: 12px; padding: 10px 14px; border: 1px solid var(--md-outline-variant); border-radius: 10px; color: var(--md-on-surface); background: var(--md-surface-container); box-shadow: var(--md-elevation-1); font-size: 12px; }
+.focus-banner[hidden] { display: none; }
+.focus-banner button { padding: 6px 10px; border: 0; border-radius: 6px; color: var(--md-on-primary); background: var(--md-primary); }
+
+.reroute-action { width: 100%; margin-top: 12px; padding: 10px; border: 1px solid var(--md-outline-variant); border-radius: 8px; background: var(--md-surface-container); color: var(--md-on-surface); }
+
+.completion-cross {
+  position: absolute;
+  inset: 7px;
+  width: calc(100% - 14px);
+  height: calc(100% - 14px);
+  z-index: 1;
+  pointer-events: none;
+}
+.completion-cross path {
+  fill: none;
+  stroke: var(--md-primary);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  opacity: 0.8;
+}
+.node.simulation-complete .node-footer { position: relative; z-index: 2; }
+.pacing-bar { position: relative; }
+.node-solve-action {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+  font-size: 10px;
+  line-height: 18px;
+  cursor: pointer;
+}
+.node-solve-action[aria-pressed="true"] {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+.node.simulation-available, .pacing-bar.simulation-available {
+  outline: 2px solid var(--md-primary);
+  outline-offset: 2px;
+}
+.node.simulation-blocked, .pacing-bar.simulation-blocked,
+.edge-group.simulation-blocked, .group-box.simulation-blocked {
+  opacity: 0.2;
+}
+.edge-group.simulation-flowing .edge-path {
+  stroke: var(--md-primary);
+  opacity: 0.25;
+}
+.edge-group.simulation-traversed .edge-path { stroke: var(--md-primary); }
+.edge-group.simulation-flowing .edge-arrow, .edge-group.simulation-traversed .edge-arrow {
+  fill: var(--md-primary);
+}
+.edge-flow {
+  fill: none;
+  stroke: var(--md-primary);
+  stroke-width: calc(2.5px * var(--graph-emphasis-scale, 1));
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: calc(6px * var(--graph-emphasis-scale, 1)) calc(8px * var(--graph-emphasis-scale, 1));
+  animation: simulation-flow 0.9s linear infinite;
+  pointer-events: none;
+}
+.edge-group.simulation-flowing .edge-label-bg {
+  stroke: var(--md-primary);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 5;
+  animation: simulation-token-flow 0.9s linear infinite;
+}
+@keyframes simulation-flow {
+  to { stroke-dashoffset: calc(-14px * var(--graph-emphasis-scale, 1)); }
+}
+@keyframes simulation-token-flow {
+  to { stroke-dashoffset: -22; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .edge-flow, .edge-group.simulation-flowing .edge-label-bg { animation: none; }
 }

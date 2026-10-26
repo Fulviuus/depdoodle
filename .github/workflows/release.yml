@@ -30,7 +30,7 @@ jobs:
             args: "--target aarch64-apple-darwin"
             rustTarget: "aarch64-apple-darwin"
           - name: macOS Intel
-            platform: macos-13
+            platform: macos-15-intel
             args: "--target x86_64-apple-darwin"
             rustTarget: "x86_64-apple-darwin"
 
@@ -43,6 +43,12 @@ jobs:
         with:
           node-version: "lts/*"
           cache: npm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src-d2/go.mod
+          cache-dependency-path: src-d2/go.sum
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,6 +70,13 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Run regression tests
+        run: npm test
+
+      - name: Test native D2 helper
+        working-directory: src-d2
+        run: go test ./...
 
       - name: Build and upload release assets
         uses: tauri-apps/tauri-action@v0

@@ -1,0 +1,21 @@
+import { expect, it, vi } from "vitest";
+vi.mock("@tauri-apps/api/core", () => ({ isTauri: () => false }));
+vi.mock("@d2lang/d2", () => ({ D2: class { compile = () => new Promise(() => {}); } }));
+it("offers a draft after restart, prevents accidental replacement, and recovers it", async () => {
+  document.body.innerHTML = '<div id="app"></div>';
+  vi.spyOn(HTMLCanvasElement.prototype,"getContext").mockReturnValue({measureText:()=>({width:50})} as never);
+  HTMLDialogElement.prototype.showModal = function () { this.open=true; };
+  HTMLDialogElement.prototype.close = function (value="") { this.returnValue=value; this.open=false; this.dispatchEvent(new Event("close")); };
+  const graph = {format:"depdoodle.graph",version:1,title:"Recovered work",nodes:[],edges:[],groups:[]};
+  localStorage.setItem("depdoodle.recovery",JSON.stringify({document:graph,sourceName:"draft.depdoodle",savedKey:"older version"}));
+  const app = await import("../src/main");
+  expect(document.getElementById("recover-draft")?.hasAttribute("hidden")).toBe(false);
+  document.getElementById("new-graph")!.click();
+  expect(document.querySelector("dialog")?.textContent).toContain("An unsaved draft is available");
+  document.querySelector("dialog")!.close("cancel");
+  await Promise.resolve();
+  expect(localStorage.getItem("depdoodle.recovery")).not.toBeNull();
+  document.getElementById("recover-draft")!.click();
+  expect(app.createGraphDocument().title).toBe("Recovered work");
+  expect(document.getElementById("save-status")?.textContent).toBe("Unsaved changes");
+});
