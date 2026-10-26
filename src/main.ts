@@ -42,6 +42,7 @@ type Tool = "select" | "node" | "connect";
 type ThemeMode = "light" | "dark";
 type ExportFormat = "png" | "jpg" | "pdf" | "svg";
 type CenterTab = "chart" | "pacing";
+type NodeResizeCorner = "nw" | "ne" | "sw" | "se";
 
 interface PuzzleNode {
   id: string;
@@ -90,16 +91,59 @@ interface GraphDocumentV1 {
   groups?: PuzzleGroup[];
 }
 
-interface GraphHistorySnapshot {
-  world: {
-    width: number;
-    height: number;
-  };
+interface CrossTabReference {
+  id: string;
+  from: string;
+  toTabId: string;
+  toNodeId: string;
+  label: string;
+  sourcePosition?: Point;
+  targetPosition?: Point;
+}
+
+interface GraphTab {
+  id: string;
+  name: string;
+  description: string;
+  world: { width: number; height: number };
   nodes: PuzzleNode[];
   edges: DependencyEdge[];
   groups: PuzzleGroup[];
+  references: CrossTabReference[];
+}
+
+interface GraphDocumentV2 {
+  format: "depdoodle.graph";
+  version: 2;
   title: string;
-  description: string;
+  description?: string;
+  tabs: GraphTab[];
+}
+
+type ProjectDocument = GraphDocumentV1 | GraphDocumentV2;
+
+interface GraphTabView {
+  zoom: number;
+  scrollLeft: number;
+  scrollTop: number;
+  centerTab: CenterTab;
+  selectedNodeIds: string[];
+  selectedEdgeId: string | null;
+  selectedGroupId: string | null;
+  diagnosticKeys: string[];
+  focusIds: string[] | null;
+  search: string;
+  simulation: boolean;
+  completedIds: string[];
+  routes: RoutedLayout | null;
+  routesDirty: boolean;
+  routingError: string | null;
+}
+
+interface GraphHistorySnapshot {
+  project: GraphDocumentV2;
+  activeTabId: string;
+  inspectorMode: "selection" | "project";
   selectedNodeIds: string[];
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
@@ -138,7 +182,7 @@ interface RecentGraph {
   title: string;
   sourceName: string;
   openedAt: string;
-  document: GraphDocumentV1;
+  document: GraphDocumentV2;
   filePath?: string;
 }
 
@@ -269,7 +313,7 @@ declare global {
     __depdoodleDebug?: {
       autoLayout: () => Promise<void>;
       labelAttachmentReport: () => ReturnType<typeof edgeLabelAttachmentReport>;
-      loadGraph: (document: GraphDocumentV1) => void;
+      loadGraph: (document: ProjectDocument) => void;
       waitForRouting: () => Promise<void>;
     };
   }
@@ -288,12 +332,18 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 2.5;
 const ZOOM_STEP = 1.2;
 const SNAP_GRID_SIZE = 24;
+const DEFAULT_NODE_WIDTH = SNAP_GRID_SIZE * 9;
+const DEFAULT_NODE_HEIGHT = SNAP_GRID_SIZE * 5;
+const MIN_NODE_WIDTH = 160;
+const MIN_NODE_HEIGHT = 84;
+const MAX_NODE_WIDTH = 1600;
+const MAX_NODE_HEIGHT = 1200;
 const EXPORT_PADDING = 56;
 const EXPORT_RASTER_SCALE = 2;
 const MAX_EXPORT_PIXELS = 96_000_000;
 const EXPORT_FONT_FAMILY = 'Roboto, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-const AUTO_LAYOUT_CONFIRM_MESSAGE = "Auto Layout will move every node and replace all connector routes and label positions. You can undo it afterward. Continue?";
-const REROUTE_CONFIRM_MESSAGE = "Replace the routes and label positions of visible connections? Node positions will stay the same. You can undo it afterward.";
+const AUTO_LAYOUT_CONFIRM_MESSAGE = "Auto Layout will move all nodes and reference cards in this tab and replace its connector routes and label positions. You can undo it afterward. Continue?";
+const REROUTE_CONFIRM_MESSAGE = "Replace the routes and label positions of visible connections in this tab? Node positions will stay the same. You can undo it afterward.";
 const RECENT_GRAPHS_STORAGE_KEY = "depdoodle.recentGraphs";
 const THEME_STORAGE_KEY = "depdoodle.theme";
 const SNAP_TO_GRID_STORAGE_KEY = "depdoodle.snapToGrid";
@@ -315,6 +365,10 @@ let world = {
 let nodes: PuzzleNode[] = [];
 let edges: DependencyEdge[] = [];
 let groups: PuzzleGroup[] = [];
+let graphTabs: GraphTab[] = [];
+let activeGraphTabId = "";
+let crossTabReferences: CrossTabReference[] = [];
+const graphTabViews = new Map<string, GraphTabView>();
 let currentGraph: LoadedGraph | null = null;
 let recentGraphs: RecentGraph[] = loadRecentGraphs();
 
@@ -328,6 +382,13 @@ let diagnosticEdgeIds = new Set<string>();
 let activeTool: Tool = "select";
 let pendingConnectionFrom: string | null = null;
 let dragState: DragState | null = null;
+let nodeResizeState: {
+  nodeId: string;
+  corner: NodeResizeCorner;
+  pointerId: number;
+  start: Point;
+  origin: Pick<PuzzleNode, "x" | "y" | "width" | "height">;
+} | null = null;
 let groupDragState: GroupDragState | null = null;
 let selectionBoxState: SelectionBoxState | null = null;
 let edgeRouteDragState: EdgeRouteDragState | null = null;
@@ -338,6 +399,19 @@ let groupSerial = groups.length + 1;
 let undoStack: GraphHistorySnapshot[] = [];
 let redoStack: GraphHistorySnapshot[] = [];
 let graphEditBefore: GraphHistorySnapshot | null = null;
+let inspectorMode: "selection" | "project" = "selection";
+let graphTabDragState: { id: string; startX: number; startY: number; moved: boolean; targetId: string | null; after: boolean } | null = null;
+let suppressTabClickUntil = 0;
+let referenceDragState: {
+  ownerId: string;
+  referenceId: string;
+  incoming: boolean;
+  start: Point;
+  origin: Point;
+  pointerStart: Point;
+  moved: boolean;
+} | null = null;
+let suppressReferenceClick: { ownerId: string; referenceId: string; until: number } | null = null;
 let layoutEngine: D2LayoutEngine | null = null;
 let layoutEngineLoadPromise: Promise<D2LayoutEngine | null> | null = null;
 let layoutActionRunning = false;
@@ -378,7 +452,7 @@ app.innerHTML = `
         </button>
       </div>
       <nav class="toolbar" aria-label="Chart tools">
-        <button class="tool-button" id="save-graph" type="button" title="Save graph as .depdoodle">
+        <button class="tool-button" id="save-graph" type="button" title="Save all graph tabs as one .depdoodle project">
           <i data-lucide="save"></i>
           <span>Save</span>
         </button>
@@ -456,16 +530,16 @@ app.innerHTML = `
           <img class="welcome-logo-dark" src="/depdoodle-logo-dark.svg" alt="DepDoodle" width="600" height="152" />
         </div>
         <h1>Puzzle dependency charts editor</h1>
-        <p class="welcome-copy">Create a chart, load a saved <code>.depdoodle</code> graph, or reopen recent work.</p>
+        <p class="welcome-copy">Create a project, open a saved <code>.depdoodle</code> file, or reopen recent work.</p>
         <div class="welcome-actions">
           <button class="secondary-button" id="recover-draft" type="button" hidden>Recover unsaved draft</button>
-          <button class="welcome-action primary" id="new-graph" type="button" title="Create a new graph">
+          <button class="welcome-action primary" id="new-graph" type="button" title="Create a new project">
             <i data-lucide="file-plus-2"></i>
-            <span>New Graph</span>
+            <span>New Project</span>
           </button>
-          <button class="welcome-action" id="load-graph" type="button" title="Load a .depdoodle graph">
+          <button class="welcome-action" id="load-graph" type="button" title="Open a .depdoodle project">
             <i data-lucide="folder-open"></i>
-            <span>Load Graph</span>
+            <span>Open Project</span>
           </button>
         </div>
       </section>
@@ -483,6 +557,11 @@ app.innerHTML = `
     </main>
 
     <div class="workbench" id="workbench">
+      <div class="graph-tabbar" aria-label="Project graphs">
+        <div id="graph-tabs" class="graph-tabs" role="tablist" aria-label="Graph tabs"></div>
+        <button id="add-graph-tab" class="tab-action" type="button" title="Add a separate graph" aria-label="Add graph tab">+</button>
+        <button id="delete-graph-tab" class="tab-action" type="button" title="Delete the active tab and its contents">Delete tab…</button>
+      </div>
       <aside class="analysis-pane">
         <section class="explorer"><label for="node-search">Find a puzzle</label>
           <input id="node-search" type="search" placeholder="Search titles and memos" />
@@ -514,11 +593,16 @@ app.innerHTML = `
             <i data-lucide="triangle-alert"></i>
             <h2>Checks</h2>
           </div>
+          <p id="checks-scope" class="field-help"></p>
           <div class="warnings" id="warnings"></div>
         </section>
       </aside>
 
-      <main class="canvas-pane">
+      <main class="canvas-pane" id="graph-tab-content" role="tabpanel">
+        <div class="project-heading">
+          <button id="project-title-button" type="button" title="Edit project name and description" aria-pressed="false">Untitled Project</button>
+          <p id="project-description-summary" hidden></p>
+        </div>
         <div class="center-tabs" role="tablist" aria-label="Graph views">
           <button class="center-tab active" id="view-chart" type="button" role="tab" aria-selected="true" aria-controls="chart-panel" title="Show dependency chart">
             <i data-lucide="workflow"></i>
@@ -544,6 +628,7 @@ app.innerHTML = `
                 <svg class="edge-layer" id="edge-layer" width="${world.width}" height="${world.height}" viewBox="0 0 ${world.width} ${world.height}">
                 </svg>
                 <div class="node-layer" id="node-layer"></div>
+                <div class="cross-tab-layer" id="cross-tab-layer"></div>
               </div>
             </div>
           </div>
@@ -560,7 +645,7 @@ app.innerHTML = `
         <section>
           <div class="pane-heading">
             <i data-lucide="panel-right"></i>
-            <h2>Inspector</h2>
+            <h2 id="inspector-heading">Tab inspector</h2>
           </div>
           <div id="inspector"></div>
         </section>
@@ -635,6 +720,76 @@ must<HTMLButtonElement>("#view-pacing").addEventListener("click", () => {
 
 must<HTMLButtonElement>("#save-graph").addEventListener("click", () => {
   void saveGraph();
+});
+
+must<HTMLButtonElement>("#project-title-button").addEventListener("click", openProjectInspector);
+must<HTMLButtonElement>("#add-graph-tab").addEventListener("click", addGraphTab);
+must<HTMLButtonElement>("#delete-graph-tab").addEventListener("click", () => { void deleteGraphTab(); });
+must<HTMLElement>("#graph-tabs").addEventListener("click", event => {
+  if (event.detail && Date.now() < suppressTabClickUntil) return;
+  const button = (event.target as Element).closest<HTMLButtonElement>("[data-graph-tab]");
+  if (button?.dataset.graphTab) activateGraphTabFromBar(button.dataset.graphTab);
+});
+must<HTMLElement>("#graph-tabs").addEventListener("dblclick", event => {
+  if ((event.target as Element).closest("[data-graph-tab]")) focusTabName();
+});
+must<HTMLElement>("#graph-tabs").addEventListener("pointerdown", event => {
+  const button = (event.target as Element).closest<HTMLButtonElement>("[data-graph-tab]");
+  if (event.button !== 0 || !button?.dataset.graphTab) return;
+  event.preventDefault();
+  graphTabDragState = { id: button.dataset.graphTab, startX: event.clientX, startY: event.clientY,
+    moved: false, targetId: null, after: false };
+  window.addEventListener("pointermove", handleGraphTabDragMove);
+  window.addEventListener("pointerup", finishGraphTabDrag, { once: true });
+  window.addEventListener("pointercancel", cancelGraphTabDrag, { once: true });
+});
+must<HTMLElement>("#graph-tabs").addEventListener("keydown", event => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const index = graphTabs.findIndex(tab => tab.id === activeGraphTabId);
+  if (event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+    const target = index + (event.key === "ArrowRight" ? 1 : -1);
+    if (target >= 0 && target < graphTabs.length) reorderGraphTab(activeGraphTabId, graphTabs[target].id, target > index);
+    [...document.querySelectorAll<HTMLButtonElement>("[data-graph-tab]")].find(button => button.dataset.graphTab === activeGraphTabId)?.focus();
+    return;
+  }
+  const next = event.key === "Home" ? 0 : event.key === "End" ? graphTabs.length - 1
+    : (index + (event.key === "ArrowRight" ? 1 : -1) + graphTabs.length) % graphTabs.length;
+  switchGraphTab(graphTabs[next].id);
+  [...document.querySelectorAll<HTMLButtonElement>("[data-graph-tab]")].find(button => button.dataset.graphTab === activeGraphTabId)?.focus();
+});
+function handleReferenceNavigation(event: MouseEvent) {
+  const target = (event.target as Element).closest<HTMLElement>("[data-jump-tab]");
+  if (target?.dataset.jumpTab && target.dataset.jumpNode) {
+    event.stopPropagation();
+    if (event.detail && suppressReferenceClick && Date.now() < suppressReferenceClick.until &&
+        target.dataset.referenceOwner === suppressReferenceClick.ownerId && target.dataset.referenceId === suppressReferenceClick.referenceId) {
+      event.preventDefault();
+      suppressReferenceClick = null;
+      return;
+    }
+    jumpToTabNode(target.dataset.jumpTab, target.dataset.jumpNode);
+  }
+}
+must<HTMLElement>("#cross-tab-layer").addEventListener("pointerdown", beginReferenceDrag);
+must<HTMLElement>("#cross-tab-layer").addEventListener("click", handleReferenceNavigation);
+inspector.addEventListener("change", event => {
+  const input = (event.target as Element).closest<HTMLInputElement>("[data-reference-label]");
+  if (!input) return;
+  withGraphEdit(() => {
+    graphTabs = tabsWithActiveGraph().map(tab => tab.id === input.dataset.referenceOwner
+      ? { ...tab, references: tab.references.map(reference => reference.id === input.dataset.referenceLabel
+        ? { ...reference, label: input.value.trim() } : reference) } : tab);
+    crossTabReferences = graphTabs.find(tab => tab.id === activeGraphTabId)!.references;
+    renderCrossTabReferences();
+  });
+});
+inspector.addEventListener("click", event => {
+  handleReferenceNavigation(event);
+  const target = (event.target as Element).closest<HTMLElement>("[data-remove-cross-reference]");
+  if (target?.dataset.referenceOwner && target.dataset.removeCrossReference) {
+    removeCrossTabReference(target.dataset.referenceOwner, target.dataset.removeCrossReference);
+  }
 });
 
 undoButton.addEventListener("click", () => {
@@ -731,7 +886,7 @@ graphSpace.addEventListener("pointermove", (event) => {
 
   const point = getCanvasPoint(event.clientX, event.clientY);
 
-  nodeGhostPosition = positionNodeForPlacement(point.x - 105, point.y - 58);
+  nodeGhostPosition = positionNodeForPlacement(point.x - DEFAULT_NODE_WIDTH / 2, point.y - DEFAULT_NODE_HEIGHT / 2);
   renderNodeGhost();
 });
 
@@ -754,7 +909,7 @@ graphSpace.addEventListener("pointerdown", (event) => {
   const point = getCanvasPoint(event.clientX, event.clientY);
 
   if (activeTool === "node") {
-    const ghostPosition = nodeGhostPosition ?? positionNodeForPlacement(point.x - 105, point.y - 58);
+    const ghostPosition = nodeGhostPosition ?? positionNodeForPlacement(point.x - DEFAULT_NODE_WIDTH / 2, point.y - DEFAULT_NODE_HEIGHT / 2);
     addNodeAt(ghostPosition.x, ghostPosition.y);
     return;
   }
@@ -769,6 +924,11 @@ graphSpace.addEventListener("pointerdown", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && nodeResizeState) {
+    event.preventDefault();
+    cancelNodeResize();
+    return;
+  }
   if (event.key === "Escape") {
     setExportMenuOpen(false);
   }
@@ -881,6 +1041,7 @@ function isSelectionModifier(event: MouseEvent | PointerEvent) {
 }
 
 function selectOnlyNode(nodeId: string) {
+  inspectorMode = "selection";
   selectedNodeIds = new Set([nodeId]);
   selectedNodeId = nodeId;
   selectedEdgeId = null;
@@ -889,6 +1050,7 @@ function selectOnlyNode(nodeId: string) {
 }
 
 function setSelectedNodes(nodeIds: Iterable<string>, primaryNodeId?: string) {
+  inspectorMode = "selection";
   const knownNodeIds = new Set(nodes.map((node) => node.id));
   selectedNodeIds = new Set([...nodeIds].filter((nodeId) => knownNodeIds.has(nodeId)));
   selectedNodeId =
@@ -915,6 +1077,7 @@ function toggleNodeSelection(nodeId: string) {
 }
 
 function selectOnlyEdge(edgeId: string) {
+  inspectorMode = "selection";
   selectedNodeIds = new Set();
   selectedNodeId = null;
   selectedEdgeId = edgeId;
@@ -923,6 +1086,7 @@ function selectOnlyEdge(edgeId: string) {
 }
 
 function selectOnlyGroup(groupId: string) {
+  inspectorMode = "selection";
   selectedNodeIds = new Set();
   selectedNodeId = null;
   selectedEdgeId = null;
@@ -931,6 +1095,7 @@ function selectOnlyGroup(groupId: string) {
 }
 
 function clearSelection() {
+  inspectorMode = "selection";
   selectedNodeIds = new Set();
   selectedNodeId = null;
   selectedEdgeId = null;
@@ -949,75 +1114,459 @@ function syncPrimarySelection() {
   setSelectedNodes(selectedNodeIds, selectedNodeId ?? undefined);
 }
 
-function captureGraphHistorySnapshot(): GraphHistorySnapshot {
+function tabsWithActiveGraph(): GraphTab[] {
+  return graphTabs.map(tab => tab.id === activeGraphTabId
+    ? { ...tab, world: { ...world }, nodes, edges, groups, references: crossTabReferences }
+    : tab);
+}
+
+function cloneTab(tab: GraphTab): GraphTab {
+  return JSON.parse(JSON.stringify(tab)) as GraphTab;
+}
+
+function createProjectDocument(clone = true): GraphDocumentV2 {
+  const description = currentGraph?.description?.trim();
   return {
-    world: { ...world },
-    nodes: nodes.map((node) => ({ ...node })),
-    edges: edges.map(cloneEdge),
-    groups: groups.map(cloneGroup),
-    title: currentGraph?.title ?? "",
-    description: currentGraph?.description ?? "",
-    selectedNodeIds: [...selectedNodeIds],
-    selectedNodeId,
-    selectedEdgeId,
-    selectedGroupId,
+    format: "depdoodle.graph", version: 2,
+    title: currentGraph?.title.trim() || "Untitled Project",
+    ...(description ? { description } : {}),
+    tabs: clone ? tabsWithActiveGraph().map(cloneTab) : tabsWithActiveGraph(),
   };
 }
 
-function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
-  nodes = snapshot.nodes.map((node) => ({ ...node }));
-  edges = snapshot.edges.map(cloneEdge);
-  groups = snapshot.groups.map(cloneGroup);
-  if (currentGraph) {
-    currentGraph = {
-      ...currentGraph,
-      title: snapshot.title,
-      description: snapshot.description.trim() ? snapshot.description : undefined,
-    };
-  }
-  selectedNodeIds = new Set(snapshot.selectedNodeIds ?? (snapshot.selectedNodeId ? [snapshot.selectedNodeId] : []));
-  selectedNodeId = snapshot.selectedNodeId;
-  selectedEdgeId = snapshot.selectedEdgeId;
-  selectedGroupId = snapshot.selectedGroupId;
+function resetGraphInteraction() {
   pendingConnectionFrom = null;
   activeTool = "select";
   nodeGhostPosition = null;
   dragState = null;
+  nodeResizeState = null;
+  delete graphSpace.dataset.resizeCorner;
+  window.removeEventListener("pointermove", handleNodeResizeMove);
+  window.removeEventListener("pointerup", finishNodeResize);
+  window.removeEventListener("pointercancel", cancelNodeResize);
   groupDragState = null;
   selectionBoxState = null;
   edgeRouteDragState = null;
   edgeLabelDragState = null;
+  referenceDragState = null;
+  suppressReferenceClick = null;
+  graphTabDragState = null;
+  window.removeEventListener("pointermove", handleGraphTabDragMove);
+  window.removeEventListener("pointerup", finishGraphTabDrag);
+  window.removeEventListener("pointercancel", cancelGraphTabDrag);
   cancelScheduledEdgePreview();
-  renderSelectionBox();
-  syncPrimarySelection();
-  if (selectedGroupId && !groups.some((group) => group.id === selectedGroupId)) {
-    selectedGroupId = null;
+  for (const listener of [handleDragMove, handleGroupDragMove, handleSelectionBoxMove, handleEdgeRouteDragMove, handleEdgeLabelDragMove, handleReferenceDragMove]) {
+    window.removeEventListener("pointermove", listener);
   }
-  window.removeEventListener("pointermove", handleEdgeRouteDragMove);
-  window.removeEventListener("pointermove", handleEdgeLabelDragMove);
-  window.removeEventListener("pointermove", handleGroupDragMove);
-  window.removeEventListener("pointerup", finishEdgeRouteDrag);
-  window.removeEventListener("pointerup", finishEdgeLabelDrag);
-  window.removeEventListener("pointerup", finishGroupDrag);
-  nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
-  edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
-  groupSerial = nextSerial(groups.map((group) => group.id), "g-custom-");
-  automaticRoutes = null;
+  for (const listener of [finishDrag, finishGroupDrag, finishSelectionBox, finishEdgeRouteDrag, finishEdgeLabelDrag, finishReferenceDrag]) {
+    window.removeEventListener("pointerup", listener);
+  }
+  window.removeEventListener("pointercancel", finishReferenceDrag);
+  renderSelectionBox();
+}
+
+function rememberActiveTabView() {
+  if (!activeGraphTabId) return;
+  graphTabs = tabsWithActiveGraph();
+  graphTabViews.set(activeGraphTabId, {
+    zoom, scrollLeft: canvasScroll.scrollLeft, scrollTop: canvasScroll.scrollTop,
+    centerTab: activeCenterTab, selectedNodeIds: [...selectedNodeIds], selectedEdgeId, selectedGroupId,
+    diagnosticKeys: [...selectedDiagnosticKeys], focusIds: focusNodeIds ? [...focusNodeIds] : null,
+    search: must<HTMLInputElement>("#node-search").value,
+    simulation: simulationActive, completedIds: [...completedNodeIds],
+    routes: automaticRoutes, routesDirty: automaticRoutesDirty, routingError,
+  });
+}
+
+function loadGraphTab(tab: GraphTab) {
+  resetGraphInteraction();
+  activeGraphTabId = tab.id;
+  nodes = tab.nodes;
+  edges = tab.edges;
+  groups = tab.groups;
+  crossTabReferences = tab.references;
+  const view = graphTabViews.get(tab.id);
+  clearSelection();
+  clearDiagnosticSelection();
+  selectedNodeIds = new Set(view?.selectedNodeIds ?? []);
+  selectedNodeId = [...selectedNodeIds][0] ?? null;
+  selectedEdgeId = view?.selectedEdgeId ?? null;
+  selectedGroupId = view?.selectedGroupId ?? null;
+  if (selectedEdgeId && !edges.some(edge => edge.id === selectedEdgeId)) selectedEdgeId = null;
+  if (selectedGroupId && !groups.some(group => group.id === selectedGroupId)) selectedGroupId = null;
+  syncPrimarySelection();
+  selectedDiagnosticKeys = new Set(view?.diagnosticKeys ?? []);
+  focusNodeIds = view?.focusIds ? new Set(view.focusIds.filter(id => !!getNode(id))) : null;
+  simulationActive = view?.simulation ?? false;
+  completedNodeIds = new Set(view?.completedIds ?? []);
+  must<HTMLInputElement>("#simulate-toggle").checked = simulationActive;
+  must<HTMLInputElement>("#node-search").value = view?.search ?? "";
+  activeCenterTab = view?.centerTab ?? "chart";
+  zoom = view?.zoom ?? 1;
+  nodeSerial = nextSerial(nodes.map(node => node.id), "n-custom-");
+  edgeSerial = nextSerial(edges.map(edge => edge.id), "e-custom-");
+  groupSerial = nextSerial(groups.map(group => group.id), "g-custom-");
+  invalidateAutomaticRoutes(); // Results for the previous tab must never be applied here.
+  automaticRoutes = view?.routes ?? null;
+  automaticRoutesDirty = view?.routesDirty ?? true;
+  routingError = view?.routingError ?? null;
+  const measured = measureGraphBounds(nodes, edges);
+  resizeWorld(Math.max(tab.world.width, measured.width, EMPTY_GRAPH_WORLD.width),
+    Math.max(tab.world.height, measured.height, EMPTY_GRAPH_WORLD.height));
+}
+
+function switchGraphTab(tabId: string, commit = true) {
+  if (!currentGraph || tabId === activeGraphTabId || !graphTabs.some(tab => tab.id === tabId)) return;
+  if (commit) commitGraphEdit();
+  rememberActiveTabView();
+  loadGraphTab(graphTabs.find(tab => tab.id === tabId)!);
+  render();
+  const view = graphTabViews.get(tabId);
+  canvasScroll.scrollLeft = view?.scrollLeft ?? 0;
+  canvasScroll.scrollTop = view?.scrollTop ?? 0;
+}
+
+function addGraphTab() {
+  if (!currentGraph) return;
+  const id = `tab-${crypto.randomUUID()}`;
+  withGraphEdit(() => {
+    graphTabs.push({ id, name: `Tab ${graphTabs.length + 1}`, description: "", world: { ...EMPTY_GRAPH_WORLD },
+      nodes: [], edges: [], groups: [], references: [] });
+    switchGraphTab(id, false);
+  });
+  focusTabName();
+}
+
+function focusTabName() {
+  commitGraphEdit();
+  clearSelection();
+  render();
+  const input = must<HTMLInputElement>("#tab-name");
+  input.focus();
+  input.select();
+}
+
+async function deleteGraphTab() {
+  if (graphTabs.length <= 1) return;
+  const id = activeGraphTabId;
+  const session = documentSession;
+  const tab = graphTabs.find(tab => tab.id === id)!;
+  const answer = await graphChoice("Delete graph tab?", `Delete “${tab.name}”, all its elements, and references to it? You can undo this.`,
+    [["cancel", "Cancel"], ["delete", "Delete tab"]]);
+  if (answer !== "delete" || session !== documentSession || activeGraphTabId !== id || graphTabs.length <= 1) return;
+  withGraphEdit(() => {
+    rememberActiveTabView();
+    const index = graphTabs.findIndex(tab => tab.id === id);
+    graphTabs = graphTabs.filter(tab => tab.id !== id).map(tab => ({ ...tab,
+      references: tab.references.filter(reference => reference.toTabId !== id) }));
+    graphTabViews.delete(id);
+    invalidateReferenceRoutes();
+    loadGraphTab(graphTabs[Math.min(index, graphTabs.length - 1)]);
+    render();
+  });
+}
+
+function activateGraphTabFromBar(tabId: string) {
+  if (tabId === activeGraphTabId) {
+    commitGraphEdit(); clearSelection(); renderNodes(); renderEdges(); renderInspector();
+  } else switchGraphTab(tabId);
+}
+
+function handleGraphTabDragMove(event: PointerEvent) {
+  const state = graphTabDragState;
+  if (!state) return;
+  if (!state.moved && Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < 5) return;
+  state.moved = true;
+  event.preventDefault();
+  const container = must<HTMLElement>("#graph-tabs");
+  const bounds = container.getBoundingClientRect();
+  clearTabDropIndicators();
+  if (event.clientY < bounds.top - 32 || event.clientY > bounds.bottom + 32) { state.targetId = null; return; }
+  if (event.clientX < bounds.left + 24) container.scrollLeft -= 12;
+  else if (event.clientX > bounds.right - 24) container.scrollLeft += 12;
+  const buttons = [...container.querySelectorAll<HTMLElement>("[data-graph-tab]")];
+  const target = buttons.find(button => event.clientX <= button.getBoundingClientRect().right) ?? buttons[buttons.length - 1];
+  if (!target) return;
+  const rect = target.getBoundingClientRect();
+  state.targetId = target.dataset.graphTab!;
+  state.after = event.clientX >= rect.left + rect.width / 2;
+  buttons.find(button => button.dataset.graphTab === state.id)?.classList.add("tab-dragging");
+  if (state.targetId !== state.id) target.classList.add(state.after ? "drop-after" : "drop-before");
+}
+
+function cancelGraphTabDrag() {
+  graphTabDragState = null;
+  window.removeEventListener("pointermove", handleGraphTabDragMove);
+  window.removeEventListener("pointerup", finishGraphTabDrag);
+  window.removeEventListener("pointercancel", cancelGraphTabDrag);
+  clearTabDropIndicators();
+}
+
+function finishGraphTabDrag() {
+  const state = graphTabDragState;
+  cancelGraphTabDrag();
+  if (!state) return;
+  suppressTabClickUntil = Date.now() + 600;
+  if (!state.moved) activateGraphTabFromBar(state.id);
+  else if (state.targetId) reorderGraphTab(state.id, state.targetId, state.after);
+}
+
+function reorderGraphTab(tabId: string, targetId: string, after = false) {
+  if (tabId === targetId || !graphTabs.some(tab => tab.id === tabId) || !graphTabs.some(tab => tab.id === targetId)) return;
+  commitGraphEdit();
+  withGraphEdit(() => {
+    const tabs = tabsWithActiveGraph();
+    const moved = tabs.find(tab => tab.id === tabId)!;
+    const rest = tabs.filter(tab => tab.id !== tabId);
+    rest.splice(rest.findIndex(tab => tab.id === targetId) + Number(after), 0, moved);
+    graphTabs = rest;
+    renderGraphTabs();
+  });
+}
+
+function clearTabDropIndicators() {
+  document.querySelectorAll(".graph-tab").forEach(tab => tab.classList.remove("tab-dragging", "drop-before", "drop-after"));
+}
+
+function renderGraphTabs() {
+  const container = must<HTMLElement>("#graph-tabs");
+  const focusedId = (document.activeElement as HTMLElement | null)?.dataset.graphTab;
+  container.innerHTML = tabsWithActiveGraph().map(tab => `<button type="button" role="tab"
+    class="graph-tab" draggable="false" data-reorderable="true" id="graph-tab-${graphTabs.findIndex(candidate => candidate.id === tab.id)}" data-graph-tab="${escapeAttribute(tab.id)}" aria-selected="${tab.id === activeGraphTabId}"
+    tabindex="${tab.id === activeGraphTabId ? 0 : -1}" aria-controls="graph-tab-content"
+    title="${escapeAttribute(`${tab.name} · ${tab.nodes.length} nodes · Drag to reorder`)}">${escapeHtml(tab.name)}</button>`).join("");
+  if (focusedId) [...container.querySelectorAll<HTMLButtonElement>("[data-graph-tab]")]
+    .find(button => button.dataset.graphTab === focusedId)?.focus({ preventScroll: true });
+  [...container.querySelectorAll<HTMLButtonElement>("[data-graph-tab]")]
+    .find(button => button.dataset.graphTab === activeGraphTabId)?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  must<HTMLButtonElement>("#delete-graph-tab").disabled = graphTabs.length <= 1;
+  must<HTMLElement>("#graph-tab-content").setAttribute("aria-labelledby", `graph-tab-${graphTabs.findIndex(tab => tab.id === activeGraphTabId)}`);
+  const name = graphTabs.find(tab => tab.id === activeGraphTabId)?.name ?? "this tab";
+  must<HTMLElement>("#checks-scope").textContent = `Checks apply only to ${name}. Cross-tab references are excluded.`;
+}
+
+interface CrossTabPortal {
+  ownerId: string;
+  reference: CrossTabReference;
+  localId: string;
+  remoteTabId: string;
+  remoteNodeId: string;
+  tabName: string;
+  nodeTitle: string;
+  incoming: boolean;
+  node: PuzzleNode;
+  edge: DependencyEdge;
+}
+
+function crossTabPortals(includeHidden = false): CrossTabPortal[] {
+  const tabs = tabsWithActiveGraph();
+  const all = tabs.flatMap(owner => owner.references.flatMap(reference => {
+    const incoming = owner.id !== activeGraphTabId;
+    if (incoming && reference.toTabId !== activeGraphTabId) return [];
+    const localId = incoming ? reference.toNodeId : reference.from;
+    const local = getNode(localId);
+    const remoteTabId = incoming ? owner.id : reference.toTabId;
+    const remoteNodeId = incoming ? reference.from : reference.toNodeId;
+    const remoteTab = tabs.find(tab => tab.id === remoteTabId);
+    const remote = remoteTab?.nodes.find(node => node.id === remoteNodeId);
+    if (!local || !remoteTab || !remote) return [];
+    return [{ ownerId: owner.id, reference, localId, remoteTabId, remoteNodeId,
+      tabName: remoteTab.name, nodeTitle: remote.title, incoming, local }];
+  })).sort((a, b) => a.local.y - b.local.y || a.local.x - b.local.x || a.reference.id.localeCompare(b.reference.id));
+  const railX = maxOf(nodes.map(node => node.x + node.width), 0) + 120;
+  let bottom = 24;
+  const visible = new Set(visibleNodes().map(node => node.id));
+  return all.flatMap(item => {
+    let id = `cross-tab:${JSON.stringify([item.ownerId, item.reference.id])}`;
+    while (nodes.some(node => node.id === id) || edges.some(edge => edge.id === id)) id = `_${id}`;
+    const automaticY = Math.max(bottom, item.local.y + item.local.height / 2 - 46);
+    bottom = automaticY + 108;
+    const position = item.incoming ? item.reference.targetPosition : item.reference.sourcePosition;
+    const x = position?.x ?? railX;
+    const y = position?.y ?? automaticY;
+    const node: PuzzleNode = { id, title: item.nodeTitle, note: "", kind: "puzzle", color: "#8264b4",
+      x, y, width: 240, height: 92 };
+    const edge: DependencyEdge = { id, from: item.incoming ? id : item.localId,
+      to: item.incoming ? item.localId : id, label: "", tokenType: "state" };
+    return includeHidden || visible.has(item.localId) ? [{ ...item, node, edge }] : [];
+  });
+}
+
+function referenceRoute(portal: CrossTabPortal) {
+  const local = getNode(portal.localId)!;
+  const from = portal.incoming ? portal.node : local;
+  const to = portal.incoming ? local : portal.node;
+  const cached = automaticRoutes?.edges.get(portal.edge.id);
+  if (cached) {
+    const points = automaticRoutePreview(portal.edge, cached, from, to) ?? pathPointsFromSvgPath(cached.path);
+    return { path: orthogonalPath(points), points, arrow: arrowForRoute(points) };
+  }
+  const start = { x: local.x + local.width, y: local.y + local.height / 2 };
+  const end = { x: portal.node.x, y: portal.node.y + portal.node.height / 2 };
+  const bend = end.x - 44;
+  const points = [start, { x: bend, y: start.y }, { x: bend, y: end.y }, end];
+  if (portal.incoming) points.reverse();
+  return { path: orthogonalPath(points), points, arrow: arrowForRoute(points) };
+}
+
+function renderCrossTabReferences() {
+  const portals = crossTabPortals();
+  const layer = must<HTMLElement>("#cross-tab-layer");
+  if (portals.length) resizeWorld(Math.max(world.width, maxOf(portals.map(item => item.node.x + item.node.width), 0) + 64),
+    Math.max(world.height, maxOf(portals.map(item => item.node.y + item.node.height), 0) + 64));
+  const available = simulationAvailableNodes();
+  layer.innerHTML = `<svg class="cross-tab-paths" width="${world.width}" height="${world.height}" aria-hidden="true">${portals.map(portal => {
+    const route = referenceRoute(portal);
+    const blocked = available && !available.has(portal.localId) && !completedNodeIds.has(portal.localId);
+    return `<g class="cross-tab-connector${blocked ? " simulation-blocked" : ""}" data-node-id="${escapeAttribute(portal.localId)}">
+      <path d="${route.path}"/><polygon points="${route.arrow.map(point => `${point.x},${point.y}`).join(" ")}"/></g>`;
+  }).join("")}</svg>${portals.map(portal => {
+    const blocked = available && !available.has(portal.localId) && !completedNodeIds.has(portal.localId);
+    return `<button class="cross-tab-card${blocked ? " simulation-blocked" : ""}" type="button"
+      data-node-id="${escapeAttribute(portal.localId)}" data-reference-owner="${escapeAttribute(portal.ownerId)}" data-reference-id="${escapeAttribute(portal.reference.id)}" data-jump-tab="${escapeAttribute(portal.remoteTabId)}" data-jump-node="${escapeAttribute(portal.remoteNodeId)}"
+      style="left:${portal.node.x}px;top:${portal.node.y}px;width:${portal.node.width}px;height:${portal.node.height}px"
+      title="${escapeAttribute(`Drag to move; click to open ${portal.nodeTitle} in ${portal.tabName}`)}">
+      <span class="cross-tab-badge">${portal.incoming ? "From" : "To"} another tab ↗</span>
+      <strong>${escapeHtml(portal.nodeTitle)}</strong><span>${escapeHtml(portal.tabName)}</span>
+      ${portal.reference.label ? `<small>${escapeHtml(portal.reference.label)}</small>` : ""}</button>`;
+  }).join("")}`;
+  applyDiagnosticHighlights(layer);
+}
+
+function updateReferencePosition(ownerId: string, referenceId: string, incoming: boolean, position: Point) {
+  graphTabs = tabsWithActiveGraph().map(tab => tab.id === ownerId ? { ...tab,
+    references: tab.references.map(reference => reference.id === referenceId
+      ? { ...reference, [incoming ? "targetPosition" : "sourcePosition"]: { ...position } } : reference) } : tab);
+  crossTabReferences = graphTabs.find(tab => tab.id === activeGraphTabId)!.references;
+}
+
+function beginReferenceDrag(event: PointerEvent) {
+  const card = (event.target as Element).closest<HTMLElement>("[data-reference-id]");
+  if (event.button !== 0 || !card) return;
+  const portal = crossTabPortals().find(portal => portal.ownerId === card.dataset.referenceOwner && portal.reference.id === card.dataset.referenceId);
+  if (!portal) return;
+  event.stopPropagation();
+  suppressReferenceClick = null;
+  referenceDragState = { ownerId: portal.ownerId, referenceId: portal.reference.id,
+    incoming: portal.incoming, start: getCanvasPoint(event.clientX, event.clientY),
+    pointerStart: { x: event.clientX, y: event.clientY }, origin: { x: portal.node.x, y: portal.node.y }, moved: false };
+  window.addEventListener("pointermove", handleReferenceDragMove);
+  window.addEventListener("pointerup", finishReferenceDrag, { once: true });
+  window.addEventListener("pointercancel", finishReferenceDrag, { once: true });
+}
+
+function handleReferenceDragMove(event: PointerEvent) {
+  const state = referenceDragState;
+  if (!state) return;
+  if (!state.moved) {
+    if (Math.hypot(event.clientX - state.pointerStart.x, event.clientY - state.pointerStart.y) < 5) return;
+    beginGraphEdit();
+    state.moved = true;
+  }
+  event.preventDefault();
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  const coordinate = (value: number) => Math.max(24, snapToGrid ? snapCoordinate(value) : value);
+  updateReferencePosition(state.ownerId, state.referenceId, state.incoming,
+    { x: coordinate(state.origin.x + point.x - state.start.x), y: coordinate(state.origin.y + point.y - state.start.y) });
+  invalidateAutomaticRoutes(true);
+  renderEdges();
+}
+
+function finishReferenceDrag() {
+  const state = referenceDragState;
+  referenceDragState = null;
+  window.removeEventListener("pointermove", handleReferenceDragMove);
+  window.removeEventListener("pointerup", finishReferenceDrag);
+  window.removeEventListener("pointercancel", finishReferenceDrag);
+  if (!state?.moved) return;
+  suppressReferenceClick = { ownerId: state.ownerId, referenceId: state.referenceId, until: Date.now() + 600 };
+  render();
+  commitGraphEdit();
+}
+
+function jumpToTabNode(tabId: string, nodeId: string) {
+  switchGraphTab(tabId);
+  if (getNode(nodeId)) inspectNodes([nodeId], nodeId);
+}
+
+function crossTabInspector(nodeId: string) {
+  const tabs = tabsWithActiveGraph();
+  const outgoing = crossTabReferences.filter(reference => reference.from === nodeId);
+  const choices = tabs.filter(tab => tab.id !== activeGraphTabId).map(tab => {
+    const available = tab.nodes.filter(node => !outgoing.some(reference => reference.toTabId === tab.id && reference.toNodeId === node.id));
+    return available.length ? `<optgroup label="${escapeAttribute(tab.name)}">${available.map(node =>
+      `<option value="${escapeAttribute(JSON.stringify([tab.id, node.id]))}">${escapeHtml(node.title)}</option>`).join("")}</optgroup>` : "";
+  }).join("");
+  const linked = tabs.flatMap(owner => owner.references.flatMap(reference => {
+    const incoming = owner.id !== activeGraphTabId;
+    if (incoming ? reference.toTabId !== activeGraphTabId || reference.toNodeId !== nodeId : reference.from !== nodeId) return [];
+    const otherTab = tabs.find(tab => tab.id === (incoming ? owner.id : reference.toTabId));
+    const otherNode = otherTab?.nodes.find(node => node.id === (incoming ? reference.from : reference.toNodeId));
+    if (!otherTab || !otherNode) return [];
+    return [`<div class="cross-reference-item"><button type="button" data-jump-tab="${escapeAttribute(otherTab.id)}" data-jump-node="${escapeAttribute(otherNode.id)}">
+      ${incoming ? "← From" : "To →"} ${escapeHtml(otherTab.name)} / ${escapeHtml(otherNode.title)} ↗</button>
+      <input data-reference-owner="${escapeAttribute(owner.id)}" data-reference-label="${escapeAttribute(reference.id)}"
+        value="${escapeAttribute(reference.label)}" placeholder="Optional reference label" aria-label="Label for reference to ${escapeAttribute(otherNode.title)}" />
+      <button type="button" class="remove-cross-reference" data-reference-owner="${escapeAttribute(owner.id)}" data-remove-cross-reference="${escapeAttribute(reference.id)}" aria-label="Remove reference to ${escapeAttribute(otherNode.title)}">Remove</button></div>`];
+  }));
+  return `<section class="cross-tab-editor"><h3>Other tabs</h3><p class="field-help">References link to another graph without affecting this tab’s checks or playthrough.</p>
+    <div class="cross-reference-list">${linked.join("")}</div>
+    <label for="cross-tab-target">Reference an element</label>
+    <select id="cross-tab-target" ${choices ? "" : "disabled"}><option value="">${choices ? "Choose from another tab…" : "No other elements available"}</option>${choices}</select>
+    <input id="cross-tab-label" placeholder="Optional reference label" aria-label="Reference label" />
+    <button type="button" id="add-cross-reference" class="secondary-button" ${choices ? "" : "disabled"}>Add reference</button></section>`;
+}
+
+function invalidateReferenceRoutes() {
+  for (const view of graphTabViews.values()) view.routesDirty = true;
   invalidateAutomaticRoutes();
-  resizeWorld(snapshot.world.width, snapshot.world.height);
+}
+
+function addCrossTabReference(from: string, toTabId: string, toNodeId: string, label = "") {
+  if (!getNode(from) || toTabId === activeGraphTabId || !graphTabs.find(tab => tab.id === toTabId)?.nodes.some(node => node.id === toNodeId)) return;
+  if (crossTabReferences.some(reference => reference.from === from && reference.toTabId === toTabId && reference.toNodeId === toNodeId)) return;
+  withGraphEdit(() => {
+    crossTabReferences = [...crossTabReferences, { id: `ref-${crypto.randomUUID()}`, from, toTabId, toNodeId, label: label.trim() }];
+    invalidateReferenceRoutes();
+    render();
+  });
+}
+
+function removeCrossTabReference(ownerId: string, referenceId: string) {
+  withGraphEdit(() => {
+    graphTabs = tabsWithActiveGraph().map(tab => tab.id === ownerId
+      ? { ...tab, references: tab.references.filter(reference => reference.id !== referenceId) } : tab);
+    crossTabReferences = graphTabs.find(tab => tab.id === activeGraphTabId)!.references;
+    invalidateReferenceRoutes();
+    render();
+  });
+}
+
+function captureGraphHistorySnapshot(): GraphHistorySnapshot {
+  return {
+    project: createProjectDocument(), activeTabId: activeGraphTabId, inspectorMode,
+    selectedNodeIds: [...selectedNodeIds], selectedNodeId, selectedEdgeId, selectedGroupId,
+  };
+}
+
+function restoreGraphHistorySnapshot(snapshot: GraphHistorySnapshot) {
+  rememberActiveTabView();
+  graphTabs = snapshot.project.tabs.map(cloneTab);
+  for (const view of graphTabViews.values()) { view.routes = null; view.routesDirty = true; }
+  if (currentGraph) currentGraph = { ...currentGraph, title: snapshot.project.title, description: snapshot.project.description };
+  loadGraphTab(graphTabs.find(tab => tab.id === snapshot.activeTabId) ?? graphTabs[0]);
+  selectedNodeIds = new Set(snapshot.selectedNodeIds);
+  selectedNodeId = snapshot.selectedNodeId;
+  selectedEdgeId = snapshot.selectedEdgeId;
+  selectedGroupId = snapshot.selectedGroupId;
+  syncPrimarySelection();
+  inspectorMode = snapshot.inspectorMode;
   render();
   noteGraphChanged();
 }
 
 function graphHistoryDataKey(snapshot: GraphHistorySnapshot) {
-  return JSON.stringify({
-    world: snapshot.world,
-    nodes: snapshot.nodes,
-    edges: snapshot.edges,
-    groups: snapshot.groups,
-    title: snapshot.title,
-    description: snapshot.description,
-  });
+  return documentDataKey(snapshot.project);
 }
 
 function graphHistoryChanged(before: GraphHistorySnapshot, after: GraphHistorySnapshot) {
@@ -1132,8 +1681,8 @@ function addNodeAt(x: number, y: number) {
       color: defaultNodeColor("puzzle"),
       x: position.x,
       y: position.y,
-      width: 210,
-      height: 118,
+      width: DEFAULT_NODE_WIDTH,
+      height: DEFAULT_NODE_HEIGHT,
     };
 
     nodeSerial += 1;
@@ -1176,19 +1725,11 @@ function addDependency(from: string, to: string) {
 async function createNewGraph() {
   if (!(await confirmLeaveGraph())) return;
   clearRecovery();
-  openGraphDocument(
-    {
-      format: "depdoodle.graph",
-      version: 1,
-      title: "Untitled Graph",
-      world: { ...EMPTY_GRAPH_WORLD },
-      nodes: [],
-      edges: [],
-      groups: [],
-    },
-    "Unsaved graph",
-    false,
-  );
+  openGraphDocument({
+    format: "depdoodle.graph", version: 2, title: "Untitled Project",
+    tabs: [{ id: "tab-1", name: "Tab 1", description: "", world: { ...EMPTY_GRAPH_WORLD },
+      nodes: [], edges: [], groups: [], references: [] }],
+  }, "Unsaved graph", false);
 }
 
 async function handleGraphFileInput() {
@@ -1200,7 +1741,7 @@ async function handleGraphFileInput() {
   }
 
   try {
-    const document = normalizeGraphDocument(JSON.parse(await file.text()));
+    const document = normalizeProjectDocument(JSON.parse(await file.text()));
     if (!(await confirmLeaveGraph())) return;
     clearRecovery();
     openGraphDocument(document, file.name);
@@ -1209,53 +1750,19 @@ async function handleGraphFileInput() {
   }
 }
 
-function openGraphDocument(document: GraphDocumentV1, sourceName: string, updateRecent = true, filePath?: string) {
+function openGraphDocument(document: ProjectDocument, sourceName: string, updateRecent = true, filePath?: string) {
+  const normalized = normalizeProjectDocument(document);
   documentSession += 1;
-  clearDiagnosticSelection();
-  automaticRoutes = null;
-  invalidateAutomaticRoutes();
-  focusNodeIds = null;
-  simulationActive = false;
-  completedNodeIds = new Set();
-  must<HTMLInputElement>("#simulate-toggle").checked = false;
-  must<HTMLInputElement>("#node-search").value = "";
   cancelRecoveryTimer();
-  const normalized = normalizeGraphDocument(document);
-  nodes = normalized.nodes.map((node) => ({ ...node }));
-  edges = normalized.edges.map(cloneEdge);
-  groups = (normalized.groups ?? []).map(cloneGroup);
-  currentGraph = {
-    title: normalized.title,
-    sourceName,
-    description: normalized.description,
-    filePath,
-  };
-  nodeSerial = nextSerial(nodes.map((node) => node.id), "n-custom-");
-  edgeSerial = nextSerial(edges.map((edge) => edge.id), "e-custom-");
-  groupSerial = nextSerial(groups.map((group) => group.id), "g-custom-");
-  clearSelection();
-  activeTool = "select";
-  nodeGhostPosition = null;
-  selectionBoxState = null;
-  renderSelectionBox();
+  graphTabViews.clear();
+  graphTabs = normalized.tabs.map(cloneTab);
+  currentGraph = { title: normalized.title, sourceName, description: normalized.description, filePath };
+  loadGraphTab(graphTabs[0]);
   resetGraphHistory();
-  zoom = 1;
-  activeCenterTab = "chart";
-
-  const measured = measureGraphBounds(nodes, edges);
-  resizeWorld(
-    Math.max(normalized.world?.width ?? 0, measured.width, EMPTY_GRAPH_WORLD.width),
-    Math.max(normalized.world?.height ?? 0, measured.height, EMPTY_GRAPH_WORLD.height),
-  );
-
   canvasScroll.scrollLeft = 0;
   canvasScroll.scrollTop = 0;
-
-  if (updateRecent) {
-    rememberGraph(normalized, sourceName, filePath);
-  }
-
-  savedDocumentKey = documentDataKey(createGraphDocument());
+  if (updateRecent) rememberGraph(normalized, sourceName, filePath);
+  savedDocumentKey = documentDataKey(createProjectDocument());
   render();
   updateSaveStatus();
 }
@@ -1276,13 +1783,12 @@ async function showWelcomeScreen() {
   render();
 }
 
-function documentDataKey(document: GraphDocumentV1) {
-  const { world: _world, ...data } = document;
-  return JSON.stringify(data);
+function documentDataKey(document: GraphDocumentV2) {
+  return JSON.stringify({ ...document, tabs: document.tabs.map(({ world: _world, ...tab }) => tab) });
 }
 
 function hasUnsavedChanges() {
-  return currentGraph !== null && documentDataKey(createGraphDocument()) !== savedDocumentKey;
+  return currentGraph !== null && documentDataKey(createProjectDocument(false)) !== savedDocumentKey;
 }
 
 function cancelRecoveryTimer() {
@@ -1292,16 +1798,17 @@ function cancelRecoveryTimer() {
 
 function noteGraphChanged() {
   if (!currentGraph) return;
+  renderGraphTabs();
   cancelRecoveryTimer();
   recoveryTimer = window.setTimeout(persistRecovery, 300);
   updateSaveStatus();
 }
 
-function readRecovery(): { document: GraphDocumentV1; sourceName: string; filePath?: string; savedKey: string } | null {
+function readRecovery(): { document: GraphDocumentV2; sourceName: string; filePath?: string; savedKey: string } | null {
   try {
     const raw = JSON.parse(localStorage.getItem(RECOVERY_STORAGE_KEY) ?? "null");
     if (!isRecord(raw)) return null;
-    return { document: normalizeGraphDocument(raw.document), sourceName: stringValue(raw.sourceName, "Recovered draft"),
+    return { document: normalizeProjectDocument(raw.document), sourceName: stringValue(raw.sourceName, "Recovered draft"),
       filePath: optionalString(raw.filePath), savedKey: stringValue(raw.savedKey, "") };
   } catch { return null; }
 }
@@ -1311,7 +1818,7 @@ function persistRecovery() {
   if (!currentGraph) return;
   try {
     if (!hasUnsavedChanges()) localStorage.removeItem(RECOVERY_STORAGE_KEY);
-    else localStorage.setItem(RECOVERY_STORAGE_KEY, JSON.stringify({ document: createGraphDocument(),
+    else localStorage.setItem(RECOVERY_STORAGE_KEY, JSON.stringify({ document: createProjectDocument(),
       sourceName: currentGraph.sourceName, filePath: currentGraph.filePath, savedKey: savedDocumentKey }));
     recoveryAvailable = true;
   } catch { recoveryAvailable = false; }
@@ -1370,11 +1877,11 @@ async function confirmLeaveGraph() {
 
 async function openGraphFile(defaultPath?: string) {
   if (!isTauriRuntime()) { graphFileInput.click(); return; }
-  const path = await showOpenDialog({ title: "Open DepDoodle Graph", defaultPath,
+  const path = await showOpenDialog({ title: "Open DepDoodle Project", defaultPath,
     multiple: false, directory: false, filters: [{ name: "DepDoodle", extensions: ["depdoodle", "json"] }] });
   if (typeof path !== "string") return;
   try {
-    const graph = normalizeGraphDocument(JSON.parse(await readTextFile(path)));
+    const graph = normalizeProjectDocument(JSON.parse(await readTextFile(path)));
     if (!(await confirmLeaveGraph())) return;
     clearRecovery();
     openGraphDocument(graph, filePathDisplayName(path), true, path);
@@ -1405,7 +1912,7 @@ async function saveGraph(): Promise<boolean> {
   commitGraphEdit();
   saving = true;
   const session = documentSession;
-  const document = createGraphDocument();
+  const document = createProjectDocument();
   const key = documentDataKey(document);
   const filename = graphFilename(document.title, currentGraph.sourceName, "depdoodle");
   const contents = `${JSON.stringify(document, null, 2)}\n`;
@@ -1423,7 +1930,7 @@ async function saveGraph(): Promise<boolean> {
       }
       if (!filePath) {
         const selected = await showSaveDialog({
-          title: "Save DepDoodle Graph", defaultPath: currentGraph.filePath ?? filename,
+          title: "Save DepDoodle Project", defaultPath: currentGraph.filePath ?? filename,
           filters: [{ name: "DepDoodle", extensions: ["depdoodle"] }], canCreateDirectories: true,
         });
         if (!selected) return false;
@@ -1454,37 +1961,30 @@ async function saveGraph(): Promise<boolean> {
 }
 
 async function exportGraph(format: ExportFormat) {
-  if (!currentGraph) {
-    return;
-  }
-
+  if (!currentGraph) return;
+  const session = documentSession;
+  const tabId = activeGraphTabId;
   try {
     await ensureAutomaticRouting();
-    const basename = graphFilenameBase(currentGraph.title, currentGraph.sourceName);
+    if (session !== documentSession || tabId !== activeGraphTabId || !currentGraph) return;
+    const tabName = graphTabs.find(tab => tab.id === tabId)?.name ?? "Graph";
+    const projectBase = graphFilenameBase(currentGraph.title, currentGraph.sourceName);
+    const basename = graphTabs.length > 1 ? `${projectBase} - ${graphFilenameBase(tabName, "")}` : projectBase;
     const extension = extensionForExportFormat(format);
     const filename = `${basename}.${extension}`;
-
+    // Capture the active graph before a file dialog or encoding yields control.
+    const blob = await blobForExportFormat(format);
     if (isTauriRuntime()) {
       const filePath = await showSaveDialog({
-        title: `Export ${format.toUpperCase()}`,
-        defaultPath: filename,
-        filters: [filterForExportFormat(format)],
-        canCreateDirectories: true,
+        title: `Export ${tabName} as ${format.toUpperCase()}`, defaultPath: filename,
+        filters: [filterForExportFormat(format)], canCreateDirectories: true,
       });
-
-      if (!filePath) {
-        return;
-      }
-
-      const blob = await blobForExportFormat(format);
-      await writeFile(
-        ensureFileExtension(filePath, extension, acceptedExtensionsForExportFormat(format)),
-        new Uint8Array(await blob.arrayBuffer()),
-      );
+      if (!filePath) return;
+      await writeFile(ensureFileExtension(filePath, extension, acceptedExtensionsForExportFormat(format)),
+        new Uint8Array(await blob.arrayBuffer()));
       return;
     }
-
-    downloadBlob(await blobForExportFormat(format), filename);
+    downloadBlob(blob, filename);
   } catch (error) {
     window.alert(error instanceof Error ? error.message : "Unable to export chart.");
   }
@@ -1496,7 +1996,7 @@ function createGraphDocument(): GraphDocumentV1 {
   return {
     format: "depdoodle.graph",
     version: 1,
-    title: currentGraph?.title.trim() || "Untitled Graph",
+    title: currentGraph?.title.trim() || "Untitled Project",
     ...(description ? { description } : {}),
     world: { ...world },
     nodes: nodes.map((node) => ({ ...node })),
@@ -1526,6 +2026,7 @@ function renderGraphToCanvas(): RasterExport {
   drawExportGroups(context);
   drawExportEdges(context);
   drawExportNodes(context);
+  drawExportReferences(context);
 
   return { canvas, bounds };
 }
@@ -1572,6 +2073,12 @@ function measureExportBounds(): ExportBounds {
       xs.push(route.labelX - metrics.width / 2, route.labelX + metrics.width / 2);
       ys.push(route.labelY - metrics.height / 2, route.labelY + metrics.height / 2);
     }
+  });
+
+  crossTabPortals().forEach(portal => {
+    xs.push(portal.node.x, portal.node.x + portal.node.width);
+    ys.push(portal.node.y, portal.node.y + portal.node.height);
+    referenceRoute(portal).points.forEach(point => { xs.push(point.x); ys.push(point.y); });
   });
 
   if (xs.length === 0 || ys.length === 0) {
@@ -2015,11 +2522,12 @@ function routeForEdge(edge: DependencyEdge): RoutedEdgeLayout | null {
 // While D2 is working, retain its chosen ports and bend directions. Reattaching
 // by guessing a side from the next bend made ports flip during an otherwise
 // unchanged drag, and moving every label to the midpoint added another jump.
-function automaticRoutePreview(edge: DependencyEdge, route: RoutedEdgeLayout): Point[] | null {
+function automaticRoutePreview(edge: DependencyEdge, route: RoutedEdgeLayout,
+  from: Pick<PuzzleNode, "x" | "y" | "width" | "height"> | undefined = getNode(edge.from),
+  to: Pick<PuzzleNode, "x" | "y" | "width" | "height"> | undefined = getNode(edge.to)): Point[] | null {
   const oldFrom = automaticRoutes?.nodes.get(edge.from), oldTo = automaticRoutes?.nodes.get(edge.to);
-  const from = getNode(edge.from), to = getNode(edge.to);
   if (!oldFrom || !oldTo || !from || !to) return null;
-  const unchanged = (before: RoutedNodeLayout, after: PuzzleNode) =>
+  const unchanged = (before: RoutedNodeLayout, after: Pick<PuzzleNode, "x" | "y" | "width" | "height">) =>
     before.x === after.x && before.y === after.y && before.width === after.width && before.height === after.height;
   if (unchanged(oldFrom, from) && unchanged(oldTo, to)) return null;
   const points = pathPointsFromSvgPath(route.path);
@@ -2036,7 +2544,7 @@ function automaticRoutePreview(edge: DependencyEdge, route: RoutedEdgeLayout): P
   if (points.length === 3 && startHorizontal === endHorizontal) {
     points.splice(2, 0, { ...points[1] });
   }
-  const movePort = (point: Point, before: RoutedNodeLayout, after: PuzzleNode) => ({
+  const movePort = (point: Point, before: RoutedNodeLayout, after: Pick<PuzzleNode, "x" | "y" | "width" | "height">) => ({
     x: after.x + (point.x - before.x) * after.width / before.width,
     y: after.y + (point.y - before.y) * after.height / before.height,
   });
@@ -2540,6 +3048,7 @@ function renderGraphToSvg(bounds: ExportBounds) {
   ${svgGroups(styles)}
   ${svgEdges(styles)}
   ${svgNodes(styles)}
+  ${svgReferences(styles)}
 </svg>
 `;
 }
@@ -2622,6 +3131,58 @@ function svgEdges(styles: ReturnType<typeof exportStyles>) {
     .join("");
 
   return `<g>${edgeLines}${edgeLabels}</g>`;
+}
+
+function referenceColor() {
+  return themeMode === "dark" ? "#bba0ed" : "#7455ab";
+}
+
+function svgReferences(styles: ReturnType<typeof exportStyles>) {
+  return crossTabPortals().map(portal => {
+    const { x, y, width, height } = portal.node;
+    const route = referenceRoute(portal);
+    const line = (text: string, offset: number, size: number) => `<text x="${x + 12}" y="${y + offset}" fill="${escapeAttribute(styles.text)}" font-family="${escapeAttribute(EXPORT_FONT_FAMILY)}" font-size="${size}">${escapeHtml(ellipsizeTextForFont(text, width - 24, exportFont(size, 500)))}</text>`;
+    return `<g><path d="${route.path}" fill="none" stroke="${referenceColor()}" stroke-width="2" stroke-dasharray="7 5" />
+      <polygon points="${route.arrow.map(point => `${point.x},${point.y}`).join(" ")}" fill="${referenceColor()}" />
+      <rect x="${x}" y="${y}" width="${width}" height="${height}" rx="8" fill="${escapeAttribute(styles.surface)}" stroke="${referenceColor()}" stroke-dasharray="7 5" />
+      ${line(`${portal.incoming ? "From" : "To"} another tab ↗`, 18, 10)}${line(portal.nodeTitle, 39, 13)}
+      ${line(portal.tabName, 59, 12)}${portal.reference.label ? line(portal.reference.label, 78, 11) : ""}</g>`;
+  }).join("");
+}
+
+function drawExportReferences(context: CanvasRenderingContext2D) {
+  const styles = exportStyles();
+  crossTabPortals().forEach(portal => {
+    const { x, y, width, height } = portal.node;
+    const route = referenceRoute(portal);
+    context.save();
+    context.strokeStyle = referenceColor();
+    context.lineWidth = 2;
+    context.setLineDash([7, 5]);
+    context.stroke(new Path2D(route.path));
+    context.fillStyle = styles.surface;
+    roundedRect(context, x, y, width, height, 8);
+    context.fill();
+    context.stroke();
+    context.setLineDash([]);
+    context.fillStyle = referenceColor();
+    context.beginPath();
+    route.arrow.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+    context.closePath();
+    context.fill();
+    context.fillStyle = styles.text;
+    context.textAlign = "left";
+    context.textBaseline = "alphabetic";
+    const line = (text: string, offset: number, size: number) => {
+      context.font = exportFont(size, 500);
+      context.fillText(ellipsizeTextForFont(text, width - 24, context.font), x + 12, y + offset);
+    };
+    line(`${portal.incoming ? "From" : "To"} another tab ↗`, 18, 10);
+    line(portal.nodeTitle, 39, 13);
+    line(portal.tabName, 59, 12);
+    if (portal.reference.label) line(portal.reference.label, 78, 11);
+    context.restore();
+  });
 }
 
 function svgNodes(styles: ReturnType<typeof exportStyles>) {
@@ -3028,19 +3589,29 @@ async function confirmAutoLayout() {
 async function autoArrange() {
   if (layoutActionRunning || !currentGraph) return;
   const session = documentSession;
+  const tabId = activeGraphTabId;
   layoutActionRunning = true;
   try {
-    if (!(await confirmAutoLayout()) || session !== documentSession) return;
-    if (!(await initializeLayoutEngine()) || session !== documentSession) { render(); return; }
+    if (!(await confirmAutoLayout()) || (session !== documentSession || tabId !== activeGraphTabId)) return;
+    if (!(await initializeLayoutEngine()) || (session !== documentSession || tabId !== activeGraphTabId)) { render(); return; }
     const revision = routingRevision;
     try {
+      const portals = crossTabPortals(true);
       const layout = await computeRoutedLayout("auto");
-      if (session !== documentSession || revision !== routingRevision) return;
+      if ((session !== documentSession || tabId !== activeGraphTabId) || revision !== routingRevision) return;
       withGraphEdit(() => {
         nodes = nodes.map(node => {
           const position = layout.nodes.get(node.id);
           return position ? { ...node, x: position.x, y: position.y } : node;
         });
+        // Reference cards take part in layout as local visual endpoints. Save
+        // this end's position alongside the nodes so rendering and reopening
+        // use the same non-overlapping geometry returned by D2.
+        for (const portal of portals) {
+          const position = layout.nodes.get(portal.node.id);
+          if (position) updateReferencePosition(portal.ownerId, portal.reference.id, portal.incoming,
+            { x: position.x, y: position.y });
+        }
         acceptRoutedLayout(layout);
         routingError = null;
         canvasScroll.scrollLeft = 0;
@@ -3048,7 +3619,7 @@ async function autoArrange() {
         render();
       });
     } catch (error) {
-      if (session !== documentSession) return;
+      if ((session !== documentSession || tabId !== activeGraphTabId)) return;
       routingError = error instanceof Error ? error.message : "Unable to arrange this graph.";
       render();
     }
@@ -3058,24 +3629,25 @@ async function autoArrange() {
 async function rerouteConnections() {
   if (layoutActionRunning || !currentGraph || !visibleEdges().length) return;
   const session = documentSession;
+  const tabId = activeGraphTabId;
   layoutActionRunning = true;
   try {
     const confirmed = isTauriRuntime()
       ? await ask(REROUTE_CONFIRM_MESSAGE, { title: "Reroute connections", kind: "warning", okLabel: "Reroute", cancelLabel: "Cancel" })
       : window.confirm(REROUTE_CONFIRM_MESSAGE);
-    if (!confirmed || session !== documentSession) return;
-    if (!(await initializeLayoutEngine()) || session !== documentSession) { render(); return; }
+    if (!confirmed || (session !== documentSession || tabId !== activeGraphTabId)) return;
+    if (!(await initializeLayoutEngine()) || (session !== documentSession || tabId !== activeGraphTabId)) { render(); return; }
     const revision = routingRevision;
     try {
       const layout = await computeRoutedLayout("fixed");
-      if (session !== documentSession || revision !== routingRevision) return;
+      if ((session !== documentSession || tabId !== activeGraphTabId) || revision !== routingRevision) return;
       withGraphEdit(() => {
         acceptRoutedLayout(layout);
         routingError = null;
         render();
       });
     } catch (error) {
-      if (session !== documentSession) return;
+      if ((session !== documentSession || tabId !== activeGraphTabId)) return;
       routingError = error instanceof Error ? error.message : "Unable to reroute connections.";
       render();
     }
@@ -3228,7 +3800,11 @@ async function deleteGroupWithConfirmation(groupId: string) {
 }
 
 function deleteNodesById(nodeIds: Set<string>) {
-  invalidateAutomaticRoutes();
+  graphTabs = tabsWithActiveGraph().map(tab => ({ ...tab, references: tab.references.filter(reference =>
+    !(tab.id === activeGraphTabId && nodeIds.has(reference.from)) &&
+    !(reference.toTabId === activeGraphTabId && nodeIds.has(reference.toNodeId))) }));
+  crossTabReferences = graphTabs.find(tab => tab.id === activeGraphTabId)!.references;
+  invalidateReferenceRoutes();
   nodes = nodes.filter((node) => !nodeIds.has(node.id));
   edges = edges.filter((edge) => !nodeIds.has(edge.from) && !nodeIds.has(edge.to));
   groups = groups
@@ -3258,6 +3834,8 @@ function render() {
   refreshAutomaticRoutesIfNeeded();
   const analysis = analyzeGraph();
 
+  renderGraphTabs();
+  renderProjectHeading();
   renderCenterTabs();
   renderToolbar();
   renderGroups();
@@ -3337,7 +3915,7 @@ function renderWelcome() {
       if (!(await confirmLeaveGraph())) return;
       if (isTauriRuntime() && recent.filePath) {
         try {
-          const document = normalizeGraphDocument(JSON.parse(await readTextFile(recent.filePath)));
+          const document = normalizeProjectDocument(JSON.parse(await readTextFile(recent.filePath)));
           clearRecovery();
           openGraphDocument(document, recent.sourceName, true, recent.filePath);
         } catch {
@@ -3374,7 +3952,7 @@ function renderToolbar() {
   must<HTMLButtonElement>("#reroute-graph").disabled = visibleEdges().length === 0;
   updateSnapGridControl();
   layoutActionLabel.textContent = "Auto Layout";
-  autoLayoutButton.title = "Rearrange nodes by dependency layers";
+  autoLayoutButton.title = "Arrange nodes and reference cards without overlaps";
 }
 
 function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
@@ -3400,20 +3978,26 @@ function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
           style="left: ${node.x}px; top: ${node.y}px; width: ${node.width}px; height: ${node.height}px; --node-color: ${nodeColor(node)};"
         >
           ${completionCross(node.id)}
-          <div class="node-topline">
-            <span class="kind-swatch" aria-hidden="true"></span>
-            <span>${escapeHtml(labelForKind(node.kind))}</span>
-            <span class="node-role">${role}</span>
+          <div class="node-content">
+            <div class="node-topline">
+              <span class="kind-swatch" aria-hidden="true"></span>
+              <span>${escapeHtml(labelForKind(node.kind))}</span>
+              <span class="node-role">${role}</span>
+            </div>
+            <h3>${escapeHtml(node.title)}</h3>
+            <p>${escapeHtml(node.note)}</p>
+            <div class="node-footer">
+              <span>${incoming} in</span>
+              <span>${outgoing} out</span>
+              ${difficultyMarkup}
+              ${available && (available.has(node.id) || completedNodeIds.has(node.id))
+                ? `<button class="node-solve-action" type="button" data-toggle-solved="${escapeAttribute(node.id)}" aria-pressed="${completedNodeIds.has(node.id)}" aria-label="${escapeAttribute(`${completedNodeIds.has(node.id) ? "Undo completion of" : "Mark solved:"} ${node.title}`)}">${completedNodeIds.has(node.id) ? "Undo" : "Solve"}</button>` : ""}
+            </div>
           </div>
-          <h3>${escapeHtml(node.title)}</h3>
-          <p>${escapeHtml(node.note)}</p>
-          <div class="node-footer">
-            <span>${incoming} in</span>
-            <span>${outgoing} out</span>
-            ${difficultyMarkup}
-            ${available && (available.has(node.id) || completedNodeIds.has(node.id))
-              ? `<button class="node-solve-action" type="button" data-toggle-solved="${escapeAttribute(node.id)}" aria-pressed="${completedNodeIds.has(node.id)}" aria-label="${escapeAttribute(`${completedNodeIds.has(node.id) ? "Undo completion of" : "Mark solved:"} ${node.title}`)}">${completedNodeIds.has(node.id) ? "Undo" : "Solve"}</button>` : ""}
-          </div>
+          ${activeTool === "select" && selectedNodeIds.has(node.id) ? (["nw", "ne", "sw", "se"] as const).map(corner => `
+            <button class="node-resize-handle resize-${corner}" type="button" data-resize-corner="${corner}"
+              aria-label="${escapeAttribute(`Resize ${node.title} from ${nodeResizeCornerLabel(corner)} corner`)}"
+              title="Drag to resize; use arrow keys for fine adjustments"></button>`).join("") : ""}
         </article>
       `;
     })
@@ -3444,6 +4028,13 @@ function renderNodes(analysis: GraphAnalysis = analyzeGraph()) {
     });
   });
 
+  nodeLayer.querySelectorAll<HTMLButtonElement>(".node-resize-handle").forEach(handle => {
+    const nodeId = handle.closest<HTMLElement>(".node")!.dataset.nodeId!;
+    const corner = handle.dataset.resizeCorner as NodeResizeCorner;
+    handle.addEventListener("pointerdown", event => beginNodeResize(event, nodeId, corner));
+    handle.addEventListener("keydown", event => handleNodeResizeKey(event, nodeId, corner));
+  });
+
   renderNodeGhost();
   applyDiagnosticHighlights(nodeLayer);
 }
@@ -3468,19 +4059,21 @@ function renderNodeGhost() {
 
   ghost.style.left = `${nodeGhostPosition.x}px`;
   ghost.style.top = `${nodeGhostPosition.y}px`;
-  ghost.style.width = "210px";
-  ghost.style.height = "118px";
+  ghost.style.width = `${DEFAULT_NODE_WIDTH}px`;
+  ghost.style.height = `${DEFAULT_NODE_HEIGHT}px`;
   ghost.innerHTML = `
-    <div class="node-topline">
-      <span class="kind-swatch" aria-hidden="true"></span>
-      <span>Puzzle</span>
-      <span class="node-role">New</span>
-    </div>
-    <h3>New puzzle</h3>
-    <p>Click to place this node.</p>
-    <div class="node-footer">
-      <span>0 in</span>
-      <span>0 out</span>
+    <div class="node-content">
+      <div class="node-topline">
+        <span class="kind-swatch" aria-hidden="true"></span>
+        <span>Puzzle</span>
+        <span class="node-role">New</span>
+      </div>
+      <h3>New puzzle</h3>
+      <p>Click to place this node.</p>
+      <div class="node-footer">
+        <span>0 in</span>
+        <span>0 out</span>
+      </div>
     </div>
   `;
 }
@@ -3628,6 +4221,7 @@ function renderEdges(onlyIds?: Set<string>) {
     });
   }
   applyDiagnosticHighlights(edgeLayer);
+  renderCrossTabReferences();
 }
 
 // Checks and search navigate without changing which graph elements are shown.
@@ -3830,7 +4424,7 @@ function reconcileDiagnosticSelection(diagnostics: GraphDiagnostic[]) {
 
 function applyDiagnosticHighlights(root: ParentNode = document) {
   const active = selectedDiagnosticKeys.size > 0;
-  root.querySelectorAll<HTMLElement | SVGElement>(".node, .edge-group, .group-box, .pacing-bar").forEach(element => {
+  root.querySelectorAll<HTMLElement | SVGElement>(".node, .edge-group, .group-box, .pacing-bar, .cross-tab-card, .cross-tab-connector").forEach(element => {
     const highlighted = active && (element.matches(".edge-group")
       ? diagnosticEdgeIds.has(element.dataset.edgeId ?? "")
       : diagnosticNodeIds.has(element.dataset.nodeId ?? ""));
@@ -4216,7 +4810,57 @@ function criticalPathLabel(path: PuzzleNode[]) {
   return `${path[0].title} -> ${path[path.length - 1].title}`;
 }
 
+function renderProjectHeading() {
+  const button = must<HTMLButtonElement>("#project-title-button");
+  const title = currentGraph?.title.trim() || "Untitled Project";
+  button.textContent = title;
+  button.setAttribute("aria-label", `Edit project: ${title}`);
+  button.setAttribute("aria-pressed", String(inspectorMode === "project"));
+  const description = must<HTMLElement>("#project-description-summary");
+  description.textContent = currentGraph?.description ?? "";
+  description.hidden = !description.textContent;
+}
+
+function openProjectInspector() {
+  if (!currentGraph) return;
+  commitGraphEdit();
+  clearSelection();
+  inspectorMode = "project";
+  render();
+  const input = must<HTMLInputElement>("#chart-title");
+  input.focus();
+  input.select();
+}
+
+function renderProjectInspector() {
+  const tabs = tabsWithActiveGraph();
+  inspector.innerHTML = `<div class="project-inspector">
+    <div class="field-group"><label for="chart-title">Project name</label>
+      <input id="chart-title" value="${escapeAttribute(currentGraph?.title ?? "Untitled Project")}" /></div>
+    <div class="field-group"><label for="chart-description">Project description</label>
+      <textarea id="chart-description" placeholder="What is this project about?">${escapeHtml(currentGraph?.description ?? "")}</textarea></div>
+    <div class="relationship-list"><h3>Project file</h3>
+      <p>${escapeHtml(currentGraph?.sourceName === "Unsaved graph" ? "Unsaved project" : currentGraph?.sourceName ?? "")}</p>
+      <h3>Project contents</h3><p>${tabs.length} graph ${tabs.length === 1 ? "tab" : "tabs"}, ${tabs.reduce((sum, tab) => sum + tab.nodes.length, 0)} nodes</p></div>
+  </div>`;
+  for (const id of ["chart-title", "chart-description"]) bindGraphEditTransaction(must<HTMLElement>(`#${id}`));
+  must<HTMLInputElement>("#chart-title").addEventListener("input", event => {
+    updateChartMetadata({ title: (event.target as HTMLInputElement).value });
+  });
+  must<HTMLTextAreaElement>("#chart-description").addEventListener("input", event => {
+    updateChartMetadata({ description: (event.target as HTMLTextAreaElement).value });
+  });
+}
+
 function renderInspector() {
+  renderProjectHeading();
+  const heading = must<HTMLElement>("#inspector-heading");
+  if (inspectorMode === "project") {
+    heading.textContent = "Project inspector";
+    renderProjectInspector();
+    return;
+  }
+  heading.textContent = selectedNodeIds.size ? "Node inspector" : selectedEdgeId ? "Connection inspector" : selectedGroupId ? "Group inspector" : "Tab inspector";
   const selectedNodes = nodes.filter((node) => selectedNodeIds.has(node.id));
   const selectedNode = selectedNodes.length === 1 ? selectedNodes[0] : null;
   const selectedEdge = selectedEdgeId ? edges.find((edge) => edge.id === selectedEdgeId) : null;
@@ -4362,6 +5006,7 @@ function renderInspector() {
         <h3>Safe narrative context</h3>
         <p>${escapeHtml(safeFacts.length > 0 ? safeFacts.join(", ") : "Only always-known facts are guaranteed.")}</p>
       </div>
+      ${crossTabInspector(selectedNode.id)}
       <div class="field-group"><label for="narrative-reference">Narrative references</label>
         <p class="field-help">Tag events this puzzle's writing assumes have happened.</p>
         <select id="narrative-reference"><option value="">Choose an event…</option>${nodes.filter(node => node.id !== selectedNode.id && !selectedNode.narrativeReferences?.includes(node.id)).map(node => `<option value="${escapeAttribute(node.id)}">${escapeHtml(node.title)}</option>`).join("")}</select>
@@ -4416,56 +5061,38 @@ function renderInspector() {
     return;
   }
 
-  const chartTitle = currentGraph?.title ?? "Untitled Graph";
-  const chartDescription = currentGraph?.description ?? "";
-  const sourceName = currentGraph?.sourceName ?? "Unsaved graph";
-
-  inspector.innerHTML = `
-    <div class="chart-inspector">
-      <div class="field-group">
-        <label for="chart-title">Chart Name</label>
-        <input id="chart-title" value="${escapeAttribute(chartTitle)}" />
-      </div>
-      <div class="field-group">
-        <label for="chart-description">Description</label>
-        <textarea id="chart-description" placeholder="Project notes, scope, source, or design memo.">${escapeHtml(chartDescription)}</textarea>
-      </div>
-      <div class="relationship-list">
-        <h3>File</h3>
-        <p>${escapeHtml(sourceName)}</p>
-        <h3>Contents</h3>
-        <p>${nodes.length} nodes, ${edges.length} dependencies, ${groups.length} groups</p>
-      </div>
-      <div class="inspector-empty compact">
-        <i data-lucide="mouse-pointer-2"></i>
-        <p>Select a puzzle node, group, or dependency arrow to edit chart objects.</p>
-      </div>
-    </div>
-  `;
-
-  bindChartInspector();
-}
-
-function bindChartInspector() {
-  const titleInput = must<HTMLInputElement>("#chart-title");
-  const descriptionInput = must<HTMLTextAreaElement>("#chart-description");
-
-  bindGraphEditTransaction(titleInput);
-  bindGraphEditTransaction(descriptionInput);
-
-  titleInput.addEventListener("input", (event) => {
-    const value = (event.target as HTMLInputElement).value;
-    updateChartMetadata({ title: value });
-    renderWelcome();
+  const tab = graphTabs.find(tab => tab.id === activeGraphTabId);
+  inspector.innerHTML = `<div class="tab-inspector">
+    <div class="field-group"><label for="tab-name">Tab name</label>
+      <input id="tab-name" value="${escapeAttribute(tab?.name ?? "")}" /></div>
+    <div class="field-group"><label for="tab-description">Tab description</label>
+      <textarea id="tab-description" placeholder="Chapter notes, setting, or scope.">${escapeHtml(tab?.description ?? "")}</textarea></div>
+    <div class="relationship-list"><h3>Tab contents</h3>
+      <p>${nodes.length} nodes, ${edges.length} dependencies, ${groups.length} groups</p></div>
+    <div class="inspector-empty compact"><i data-lucide="mouse-pointer-2"></i>
+      <p>Select a puzzle node, group, or dependency arrow to edit it.</p></div>
+  </div>`;
+  const name = must<HTMLInputElement>("#tab-name");
+  const description = must<HTMLTextAreaElement>("#tab-description");
+  bindGraphEditTransaction(name);
+  bindGraphEditTransaction(description);
+  name.addEventListener("input", () => {
+    graphTabs = graphTabs.map(tab => tab.id === activeGraphTabId ? { ...tab, name: name.value.trim() || "Untitled tab" } : tab);
+    noteGraphChanged();
   });
-
-  descriptionInput.addEventListener("input", (event) => {
-    const value = (event.target as HTMLTextAreaElement).value;
-    updateChartMetadata({ description: value });
+  description.addEventListener("input", () => {
+    graphTabs = graphTabs.map(tab => tab.id === activeGraphTabId ? { ...tab, description: description.value } : tab);
+    noteGraphChanged();
   });
 }
 
 function bindNodeInspector(nodeId: string) {
+  must<HTMLButtonElement>("#add-cross-reference").addEventListener("click", () => {
+    const value = must<HTMLSelectElement>("#cross-tab-target").value;
+    if (!value) return;
+    const [tabId, targetId] = JSON.parse(value) as [string, string];
+    addCrossTabReference(nodeId, tabId, targetId, must<HTMLInputElement>("#cross-tab-label").value);
+  });
   must<HTMLSelectElement>("#prerequisite-mode").addEventListener("change", event => withGraphEdit(() => {
     updateNode(nodeId, { prerequisiteMode: (event.target as HTMLSelectElement).value === "any" ? "any" : "all" }); render();
   }));
@@ -4702,7 +5329,7 @@ function rectsIntersect(a: Rect, b: Rect) {
 function handleGroupPointerDown(event: PointerEvent, groupId: string) {
   if (activeTool === "node") {
     const point = getCanvasPoint(event.clientX, event.clientY);
-    const ghostPosition = nodeGhostPosition ?? positionNodeForPlacement(point.x - 105, point.y - 58);
+    const ghostPosition = nodeGhostPosition ?? positionNodeForPlacement(point.x - DEFAULT_NODE_WIDTH / 2, point.y - DEFAULT_NODE_HEIGHT / 2);
     addNodeAt(ghostPosition.x, ghostPosition.y);
     return;
   }
@@ -4925,6 +5552,95 @@ function finishEdgeLabelDrag() {
   commitGraphEdit();
 }
 
+function nodeResizeCornerLabel(corner: NodeResizeCorner) {
+  return { nw: "top-left", ne: "top-right", sw: "bottom-left", se: "bottom-right" }[corner];
+}
+
+function resizedNodeBounds(origin: Pick<PuzzleNode, "x" | "y" | "width" | "height">,
+  corner: NodeResizeCorner, delta: Point) {
+  const snap = (value: number) => snapToGrid ? snapCoordinate(value) : value;
+  const right = origin.x + origin.width, bottom = origin.y + origin.height;
+  const west = corner.endsWith("w"), north = corner.startsWith("n");
+  // Clamp the dragged corner, keeping the diagonally opposite corner anchored.
+  const x = west && delta.x !== 0 ? clamp(snap(origin.x + delta.x), Math.max(0, right - MAX_NODE_WIDTH), right - MIN_NODE_WIDTH) : origin.x;
+  const y = north && delta.y !== 0 ? clamp(snap(origin.y + delta.y), Math.max(0, bottom - MAX_NODE_HEIGHT), bottom - MIN_NODE_HEIGHT) : origin.y;
+  return {
+    x, y,
+    width: west ? right - x : delta.x === 0 ? origin.width : clamp(snap(right + delta.x) - x, MIN_NODE_WIDTH, MAX_NODE_WIDTH),
+    height: north ? bottom - y : delta.y === 0 ? origin.height : clamp(snap(bottom + delta.y) - y, MIN_NODE_HEIGHT, MAX_NODE_HEIGHT),
+  };
+}
+
+function applyNodeResize(nodeId: string, bounds: Pick<PuzzleNode, "x" | "y" | "width" | "height">) {
+  const node = getNode(nodeId);
+  if (!node || (node.x === bounds.x && node.y === bounds.y && node.width === bounds.width && node.height === bounds.height)) return;
+  nodes = nodes.map(candidate => candidate.id === nodeId ? { ...candidate, ...bounds } : candidate);
+  renderDraggedPositions(new Map([[nodeId, bounds]]));
+  resizeWorld(Math.max(world.width, bounds.x + bounds.width + 220), Math.max(world.height, bounds.y + bounds.height + 220));
+  scheduleEdgePreview();
+}
+
+function beginNodeResize(event: PointerEvent, nodeId: string, corner: NodeResizeCorner) {
+  event.stopPropagation();
+  if (event.button !== 0 || activeTool !== "select" || nodeResizeState) return;
+  const node = getNode(nodeId);
+  if (!node) return;
+  event.preventDefault();
+  commitGraphEdit();
+  beginGraphEdit();
+  nodeResizeState = { nodeId, corner, pointerId: event.pointerId,
+    start: getCanvasPoint(event.clientX, event.clientY),
+    origin: { x: node.x, y: node.y, width: node.width, height: node.height } };
+  graphSpace.dataset.resizeCorner = corner;
+  window.addEventListener("pointermove", handleNodeResizeMove);
+  window.addEventListener("pointerup", finishNodeResize);
+  window.addEventListener("pointercancel", cancelNodeResize);
+}
+
+function handleNodeResizeMove(event: PointerEvent) {
+  const state = nodeResizeState;
+  if (!state || event.pointerId !== state.pointerId) return;
+  event.preventDefault();
+  const point = getCanvasPoint(event.clientX, event.clientY);
+  applyNodeResize(state.nodeId, resizedNodeBounds(state.origin, state.corner,
+    { x: point.x - state.start.x, y: point.y - state.start.y }));
+}
+
+function finishNodeResize(event?: PointerEvent) {
+  if (!nodeResizeState || (event && event.pointerId !== nodeResizeState.pointerId)) return;
+  nodeResizeState = null;
+  delete graphSpace.dataset.resizeCorner;
+  window.removeEventListener("pointermove", handleNodeResizeMove);
+  window.removeEventListener("pointerup", finishNodeResize);
+  window.removeEventListener("pointercancel", cancelNodeResize);
+  cancelScheduledEdgePreview();
+  render();
+  commitGraphEdit();
+}
+
+function cancelNodeResize(event?: PointerEvent) {
+  if (!nodeResizeState || (event && event.pointerId !== nodeResizeState.pointerId)) return;
+  applyNodeResize(nodeResizeState.nodeId, nodeResizeState.origin);
+  finishNodeResize();
+}
+
+function handleNodeResizeKey(event: KeyboardEvent, nodeId: string, corner: NodeResizeCorner) {
+  const directions: Record<string, Point> = { ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 },
+    ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 } };
+  const direction = directions[event.key], node = getNode(nodeId);
+  if (!direction || !node || event.metaKey || event.ctrlKey || event.altKey) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const step = snapToGrid ? SNAP_GRID_SIZE : event.shiftKey ? 10 : 1;
+  commitGraphEdit();
+  withGraphEdit(() => {
+    applyNodeResize(nodeId, resizedNodeBounds(node, corner, { x: direction.x * step, y: direction.y * step }));
+    render();
+  });
+  [...nodeLayer.querySelectorAll<HTMLElement>(".node")].find(element => element.dataset.nodeId === nodeId)
+    ?.querySelector<HTMLElement>(`.resize-${corner}`)?.focus({ preventScroll: true });
+}
+
 function handleNodePointerDown(event: PointerEvent, nodeId: string) {
   if (activeTool === "connect") {
     if (!pendingConnectionFrom) {
@@ -5063,6 +5779,7 @@ function updateChartMetadata(patch: { title?: string; description?: string }) {
       ? { description: patch.description.trim() ? patch.description : undefined }
       : {}),
   };
+  renderProjectHeading();
   noteGraphChanged();
 }
 
@@ -5165,22 +5882,23 @@ async function ensureAutomaticRouting(): Promise<void> {
   if (!currentGraph || !automaticRoutesDirty || routingDragActive()) return;
   automaticRoutingPromise = (async () => {
     while (currentGraph && automaticRoutesDirty && !routingDragActive()) {
-      if (!edges.some(edge => !edge.manualRoute)) { automaticRoutesDirty = false; break; }
+      if (!edges.some(edge => !edge.manualRoute) && !crossTabPortals(true).length) { automaticRoutesDirty = false; break; }
       const session = documentSession;
       const revision = routingRevision;
       const contentRevision = routingContentRevision;
       const engine = await initializeLayoutEngine();
       if (!engine) { automaticRoutesDirty = false; break; }
       if (session !== documentSession || revision !== routingRevision) continue;
-      const inputNodes = nodes.map(node => ({ ...node }));
-      const inputEdges = edges.map(edge => ({ ...edge }));
+      const portals = crossTabPortals(true);
+      const inputNodes = [...nodes.map(node => ({ ...node })), ...portals.map(portal => portal.node)];
+      const inputEdges = [...edges.map(edge => ({ ...edge })), ...portals.map(portal => portal.edge)];
       try {
         const geometry = await engine.layout(inputNodes, inputEdges, "fixed");
         // Coalesce pointer movements into one in-flight calculation. A result
         // for an earlier position can refresh the live preview while the next
         // position is calculated, but never crosses a file or content change.
         if (session !== documentSession || contentRevision !== routingContentRevision) continue;
-        if (revision !== routingRevision && !dragState && !groupDragState) continue;
+        if (revision !== routingRevision && !dragState && !nodeResizeState && !groupDragState && !referenceDragState?.moved) continue;
         automaticRoutes = decorateRoutedLayout(geometry);
         routingError = null;
         automaticRoutesDirty = revision !== routingRevision;
@@ -5221,7 +5939,7 @@ function scheduleEdgePreview() {
   if (edgePreviewHandle !== null) return;
   edgePreviewHandle = window.requestAnimationFrame(() => {
     edgePreviewHandle = null;
-    const movedIds = dragState?.nodeIds ?? groupDragState?.originPositions.map(position => position.nodeId) ?? [];
+    const movedIds = nodeResizeState ? [nodeResizeState.nodeId] : dragState?.nodeIds ?? groupDragState?.originPositions.map(position => position.nodeId) ?? [];
     const affected = new Set(movedIds.flatMap(id => [...incomingEdges(id), ...outgoingEdges(id)].map(edge => edge.id)));
     renderEdges(affected);
   });
@@ -5241,7 +5959,11 @@ function applyDraggedPositions(positions: Map<string, Point>) {
 function renderDraggedPositions(positions: Map<string, Point>) {
   nodeLayer.querySelectorAll<HTMLElement>(".node").forEach(element => {
     const point = positions.get(element.dataset.nodeId ?? "");
-    if (point) { element.style.left = `${point.x}px`; element.style.top = `${point.y}px`; }
+    if (point) {
+      element.style.left = `${point.x}px`; element.style.top = `${point.y}px`;
+      const node = getNode(element.dataset.nodeId!);
+      if (node) { element.style.width = `${node.width}px`; element.style.height = `${node.height}px`; }
+    }
   });
   groupLayer.querySelectorAll<HTMLElement>(".group-box").forEach(element => {
     const group = getGroup(element.dataset.groupId ?? "");
@@ -5282,7 +6004,9 @@ function measureEdgeLabel(label: string) {
 
 async function computeRoutedLayout(mode: LayoutMode): Promise<RoutedLayout> {
   if (!layoutEngine) throw new Error("The connection router is not loaded.");
-  const geometry = await layoutEngine.layout(nodes.map(node => ({ ...node })), edges.map(edge => ({ ...edge })), mode);
+  const portals = crossTabPortals(true);
+  const geometry = await layoutEngine.layout([...nodes.map(node => ({ ...node })), ...portals.map(portal => portal.node)],
+    [...edges.map(edge => ({ ...edge })), ...portals.map(portal => portal.edge)], mode);
   const layout = decorateRoutedLayout(geometry);
   if (mode === "fixed") return layout;
   const left = minOf([...layout.nodes.values()].map(node => node.x), 0);
@@ -6015,6 +6739,67 @@ function snapCoordinateWithin(value: number, min: number, max: number) {
   return snapped;
 }
 
+function normalizeReferencePosition(value: unknown): Point | undefined {
+  if (!isRecord(value) || typeof value.x !== "number" || typeof value.y !== "number" ||
+      !Number.isFinite(value.x) || !Number.isFinite(value.y)) return undefined;
+  return { x: Math.max(0, value.x), y: Math.max(0, value.y) };
+}
+
+function normalizeProjectDocument(value: unknown): GraphDocumentV2 {
+  const record = asRecord(value, "Graph file must be an object.");
+  if (record.format === "depdoodle.graph" && record.version === 1) {
+    const graph = normalizeGraphDocument(record);
+    return { format: "depdoodle.graph", version: 2, title: graph.title, description: graph.description,
+      tabs: [{ id: "tab-1", name: graph.title, description: "", world: {
+        width: graph.world?.width ?? EMPTY_GRAPH_WORLD.width,
+        height: graph.world?.height ?? EMPTY_GRAPH_WORLD.height,
+      }, nodes: graph.nodes, edges: graph.edges, groups: graph.groups ?? [], references: [] }] };
+  }
+  if (record.format !== "depdoodle.graph" || record.version !== 2) {
+    throw new Error("Unsupported graph format. Expected depdoodle.graph version 1 or 2.");
+  }
+  if (!Array.isArray(record.tabs) || !record.tabs.length) throw new Error("A project must contain at least one graph tab.");
+  const ids = new Set<string>();
+  const tabs = record.tabs.map(value => {
+    const raw = asRecord(value, "Graph tab must be an object.");
+    const id = stringValue(raw.id, "");
+    if (!id || ids.has(id)) throw new Error("Graph tabs must have unique, nonempty IDs.");
+    ids.add(id);
+    const name = stringValue(raw.name, "Untitled tab").trim() || "Untitled tab";
+    const graph = normalizeGraphDocument({ ...raw, format: "depdoodle.graph", version: 1, title: name });
+    for (const elements of [graph.nodes, graph.edges, graph.groups ?? []]) {
+      if (new Set(elements.map(element => element.id)).size !== elements.length) {
+        throw new Error(`Duplicate element IDs in tab “${name}”.`);
+      }
+    }
+    if (raw.references !== undefined && !Array.isArray(raw.references)) throw new Error("Tab references must be an array.");
+    const referenceIds = new Set<string>();
+    const references = (Array.isArray(raw.references) ? raw.references : []).map(value => {
+      const raw = asRecord(value, "Cross-tab reference must be an object.");
+      const reference: CrossTabReference = { id: stringValue(raw.id, ""), from: stringValue(raw.from, ""),
+        toTabId: stringValue(raw.toTabId, ""), toNodeId: stringValue(raw.toNodeId, ""), label: stringValue(raw.label, ""),
+        sourcePosition: normalizeReferencePosition(raw.sourcePosition), targetPosition: normalizeReferencePosition(raw.targetPosition) };
+      if (!reference.id || referenceIds.has(reference.id) || !reference.from || !reference.toTabId || !reference.toNodeId) {
+        throw new Error("Cross-tab references need unique IDs and both endpoints.");
+      }
+      referenceIds.add(reference.id);
+      return reference;
+    });
+    return { id, name, description: stringValue(raw.description, ""), world: { width: graph.world?.width ?? EMPTY_GRAPH_WORLD.width,
+      height: graph.world?.height ?? EMPTY_GRAPH_WORLD.height },
+      nodes: graph.nodes, edges: graph.edges, groups: graph.groups ?? [], references };
+  });
+  const byId = new Map(tabs.map(tab => [tab.id, tab]));
+  for (const tab of tabs) for (const reference of tab.references) {
+    if (reference.toTabId === tab.id || !tab.nodes.some(node => node.id === reference.from) ||
+        !byId.get(reference.toTabId)?.nodes.some(node => node.id === reference.toNodeId)) {
+      throw new Error(`Invalid cross-tab reference in “${tab.name}”. Both elements must exist in different tabs.`);
+    }
+  }
+  return { format: "depdoodle.graph", version: 2, title: stringValue(record.title, "Untitled Project"),
+    description: optionalString(record.description), tabs };
+}
+
 function normalizeGraphDocument(value: unknown): GraphDocumentV1 {
   const record = asRecord(value, "Graph file must be an object.");
 
@@ -6078,8 +6863,8 @@ function normalizeGraphNode(value: unknown): PuzzleNode {
       ? [...new Set(record.narrativeReferences.filter((id): id is string => typeof id === "string" && id.length > 0))] : [],
     x: finiteNumber(record.x, 80),
     y: finiteNumber(record.y, 80),
-    width: clamp(finiteNumber(record.width, 220), 160, 420),
-    height: clamp(finiteNumber(record.height, 104), 84, 220),
+    width: clamp(finiteNumber(record.width, 220), MIN_NODE_WIDTH, MAX_NODE_WIDTH),
+    height: clamp(finiteNumber(record.height, 104), MIN_NODE_HEIGHT, MAX_NODE_HEIGHT),
   };
 }
 
@@ -6335,7 +7120,7 @@ function slugify(value: string) {
     .replace(/^-|-$/g, "");
 }
 
-function rememberGraph(document: GraphDocumentV1, sourceName: string, filePath?: string) {
+function rememberGraph(document: GraphDocumentV2, sourceName: string, filePath?: string) {
   const openedAt = new Date().toISOString();
   const id = recentGraphId(document.title, sourceName, filePath);
   recentGraphs = [
@@ -6387,7 +7172,7 @@ function loadRecentGraphs(): RecentGraph[] {
         }
 
         try {
-          const document = normalizeGraphDocument(value.document);
+          const document = normalizeProjectDocument(value.document);
           const title = stringValue(value.title, document.title);
           const sourceName = stringValue(value.sourceName, "Recent graph");
           const filePath = optionalString(value.filePath);
@@ -6500,8 +7285,8 @@ function saveRecentGraphs() {
   }
 }
 
-function cloneGraphDocument(document: GraphDocumentV1): GraphDocumentV1 {
-  return JSON.parse(JSON.stringify(document)) as GraphDocumentV1;
+function cloneGraphDocument(document: GraphDocumentV2): GraphDocumentV2 {
+  return JSON.parse(JSON.stringify(document)) as GraphDocumentV2;
 }
 
 function cloneEdge(edge: DependencyEdge): DependencyEdge {
@@ -6887,4 +7672,4 @@ if (isTauriRuntime()) {
 render();
 installDebugApi();
 
-export { openGraphDocument, analyzeGraph, criticalPathForAnalysis, createGraphDocument, saveGraph, renderGraphToCanvas, handleNativeCloseRequest, ensureAutomaticRouting };
+export { reorderGraphTab, createProjectDocument, switchGraphTab, addGraphTab, normalizeProjectDocument, renderGraphToSvgBlob, openGraphDocument, analyzeGraph, criticalPathForAnalysis, createGraphDocument, saveGraph, addCrossTabReference, renderGraphToCanvas, handleNativeCloseRequest, ensureAutomaticRouting };

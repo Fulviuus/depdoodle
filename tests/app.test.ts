@@ -13,7 +13,7 @@ const context = { scale: vi.fn(), translate: vi.fn(), fillRect: vi.fn(), beginPa
 const node = (id: string, x = 0) => ({ id, title: id, note: "", kind: "puzzle" as const, color: "#549aa3", x, y: 100, width: 210, height: 118 });
 const graph = (cyclic = false) => ({ format: "depdoodle.graph" as const, version: 1 as const, title: "Test", nodes: [node("A"), node("B", 300)], edges: [{ id: "ab", from: "A", to: "B", label: "", tokenType: "state" as const }, ...(cyclic ? [{ id: "ba", from: "B", to: "A", label: "", tokenType: "state" as const }] : [])] });
 const click = (id: string) => (document.getElementById(id) as HTMLElement).click();
-const edit = (id: string, value: string) => { const input = document.getElementById(id) as HTMLInputElement; input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
+const edit = (id: string, value: string) => { if ((id === "chart-title" || id === "chart-description") && !document.getElementById(id)) click("project-title-button"); const input = document.getElementById(id) as HTMLInputElement; input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
 beforeAll(async () => {
   document.body.innerHTML = '<div id="app"></div>';
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as never);
@@ -704,5 +704,677 @@ describe("interactive playthrough", () => {
     (button as HTMLButtonElement).click();
     expect(app.createGraphDocument()).toEqual(before);
     expect(box("A").querySelector(".completion-cross")).not.toBeNull();
+  });
+});
+
+const chapterProject = (linked = false) => ({
+  format: "depdoodle.graph" as const, version: 2 as const, title: "An adventure", tabs: [
+    { id: "chapter-1", name: "Chapter 1", world: {width:1680,height:1040},
+      nodes: [node("A", 100), node("B", 500)], edges: graph().edges, groups: [],
+      references: linked ? [{id:"ref-1",from:"B",toTabId:"chapter-2",toNodeId:"A",label:"The brass key"}] : [] },
+    { id: "chapter-2", name: "Chapter 2", world: {width:3000,height:1600},
+      nodes: [{...node("A",1800),title:"Unlock the observatory"}, {...node("X",2200),title:"Watch the comet"}],
+      edges: [{id:"ax",from:"A",to:"X",label:"",tokenType:"state" as const}], groups: [], references: [] },
+  ],
+});
+const chooseNode = (id: string) => {
+  edit("node-search", id);
+  (document.querySelector(`[data-search-node='${id}']`) as HTMLElement).click();
+};
+
+describe("separate graph tabs", () => {
+  it("migrates old files to one tab without changing their geometry", () => {
+    const legacy = {...graph(), edges:[{...graph().edges[0],manualRoute:[{x:210,y:159},{x:300,y:159}]}]};
+    app.openGraphDocument(legacy,"legacy.depdoodle",false);
+    const project = app.createProjectDocument();
+    expect(project.version).toBe(2);
+    expect(project.tabs).toHaveLength(1);
+    expect(project.tabs[0].nodes.map(n=>[n.id,n.x,n.y])).toEqual(legacy.nodes.map(n=>[n.id,n.x,n.y]));
+    expect(project.tabs[0].edges[0].manualRoute).toEqual(legacy.edges[0].manualRoute);
+    expect(document.getElementById("save-status")?.textContent).toBe("Saved");
+    expect((document.getElementById("delete-graph-tab") as HTMLButtonElement).disabled).toBe(true);
+  });
+  it("adds, renames, switches, and undoes tabs without losing graph contents", () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    const first = app.createGraphDocument().nodes;
+    click("add-graph-tab");
+    expect(app.createProjectDocument().tabs).toHaveLength(3);
+    expect(document.querySelectorAll(".node")).toHaveLength(0);
+    edit("tab-name","The finale");
+    app.switchGraphTab("chapter-1");
+    expect(app.createGraphDocument().nodes).toEqual(first);
+    expect(document.querySelector("#graph-tabs")?.textContent).toContain("The finale");
+    click("undo-graph");
+    expect(app.createProjectDocument().tabs[2].name).toBe("Tab 3");
+    click("undo-graph");
+    expect(app.createProjectDocument().tabs).toHaveLength(2);
+    click("redo-graph");
+    expect(app.createProjectDocument().tabs).toHaveLength(3);
+  });
+  it("keeps checks, zoom, search, and simulation state local to each tab", () => {
+    const project = chapterProject();
+    project.tabs[1].edges.push({id:"xa",from:"X",to:"A",label:"",tokenType:"state"});
+    app.openGraphDocument(project,"chapters.depdoodle",false);
+    click("zoom-out");
+    const zoom = document.getElementById("zoom-level")?.textContent;
+    const warning = [...document.querySelectorAll<HTMLButtonElement>(".diagnostic")].find(button=>button.textContent?.includes("B."))!;
+    warning.click();
+    const simulation = document.getElementById("simulate-toggle") as HTMLInputElement;
+    simulation.checked = true; simulation.dispatchEvent(new Event("change"));
+    (document.querySelector('[data-solve="A"]') as HTMLElement).click();
+    edit("node-search","B");
+    app.switchGraphTab("chapter-2");
+    expect(app.analyzeGraph().topology.hasCycle).toBe(true);
+    expect(document.querySelectorAll(".diagnostic[aria-pressed='true']")).toHaveLength(0);
+    expect(document.querySelectorAll(".completion-cross")).toHaveLength(0);
+    expect((document.getElementById("node-search") as HTMLInputElement).value).toBe("");
+    expect(document.getElementById("checks-scope")?.textContent).toContain("Chapter 2");
+    app.switchGraphTab("chapter-1");
+    expect(app.analyzeGraph().topology.hasCycle).toBe(false);
+    expect(document.getElementById("zoom-level")?.textContent).toBe(zoom);
+    expect(document.querySelectorAll(".diagnostic[aria-pressed='true']")).toHaveLength(1);
+    expect(document.querySelectorAll(".completion-cross")).toHaveLength(1);
+    expect((document.getElementById("node-search") as HTMLInputElement).value).toBe("B");
+  });
+  it("does not mark the project dirty just by switching tabs or views", async () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    await app.ensureAutomaticRouting();
+    app.switchGraphTab("chapter-2");
+    await app.ensureAutomaticRouting();
+    click("view-pacing"); app.switchGraphTab("chapter-1");
+    expect(document.getElementById("save-status")?.textContent).toBe("Saved");
+  });
+  it("supports keyboard navigation between graph tabs", () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    document.querySelector('[data-graph-tab="chapter-1"]')!.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowRight",bubbles:true}));
+    expect(document.querySelector('[data-graph-tab="chapter-2"]')?.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement?.getAttribute("data-graph-tab")).toBe("chapter-2");
+  });
+  it("saves every tab and reference even when a different tab is active", async () => {
+    native.enabled=true;
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false,"/tmp/chapters.depdoodle");
+    app.switchGraphTab("chapter-2");
+    native.write.mockResolvedValue(undefined);
+    await app.saveGraph();
+    const written = JSON.parse(native.write.mock.calls[0][1]);
+    expect(written.version).toBe(2);
+    expect(written.tabs).toHaveLength(2);
+    expect(written.tabs[0].references[0].label).toBe("The brass key");
+    expect(written.tabs[1].nodes[0].title).toBe("Unlock the observatory");
+    app.openGraphDocument(written,"chapters.depdoodle",false);
+    app.switchGraphTab("chapter-2");
+    expect(document.querySelector(".cross-tab-card")?.textContent).toContain("Chapter 1");
+  });
+  it("stores the complete project in recovery drafts", async () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    app.switchGraphTab("chapter-2");
+    edit("tab-name","Later chapter");
+    await vi.waitFor(()=>expect(localStorage.getItem("depdoodle.recovery")).not.toBeNull());
+    const recovery=JSON.parse(localStorage.getItem("depdoodle.recovery")!);
+    expect(recovery.document.tabs[1].name).toBe("Later chapter");
+    expect(recovery.document.tabs[0].references).toHaveLength(1);
+  });
+  it("ignores an in-flight routing result after switching tabs with reused node IDs", async () => {
+    const router = routing.layout.getMockImplementation()!;
+    let finish!: (value: unknown) => void;
+    let source = "";
+    routing.layout.mockImplementationOnce((input: string)=>{source=input;return new Promise(resolve=>{finish=resolve;});});
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    await vi.waitFor(()=>expect(finish).toBeDefined());
+    app.switchGraphTab("chapter-2");
+    finish(await router(source));
+    await app.ensureAutomaticRouting();
+    expect(app.createGraphDocument().nodes[0].x).toBe(1800);
+    expect(document.querySelector(".edge-path")?.getAttribute("d")).toContain("2010");
+  });
+});
+
+describe("cross-tab references", () => {
+  it("adds a labeled reference from the inspector and displays a navigable remote card", async () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    chooseNode("B");
+    const target=document.getElementById("cross-tab-target") as HTMLSelectElement;
+    target.value=JSON.stringify(["chapter-2","A"]);
+    edit("cross-tab-label","Carry the key"); click("add-cross-reference");
+    await app.ensureAutomaticRouting();
+    expect(app.createProjectDocument().tabs[0].references[0]).toMatchObject({from:"B",toTabId:"chapter-2",toNodeId:"A",label:"Carry the key"});
+    const before=app.createProjectDocument();
+    expect(document.querySelectorAll(".node")).toHaveLength(2);
+    const portal=document.querySelector<HTMLButtonElement>(".cross-tab-card")!;
+    expect(portal.textContent).toContain("To another tab");
+    expect(portal.textContent).toContain("Unlock the observatory");
+    expect(portal.textContent).toContain("Chapter 2");
+    expect(document.querySelector(".cross-tab-connector path")?.getAttribute("d")).toBeTruthy();
+    portal.click();
+    expect(document.querySelector('[data-graph-tab="chapter-2"]')?.getAttribute("aria-selected")).toBe("true");
+    expect((document.getElementById("node-title") as HTMLInputElement).value).toBe("Unlock the observatory");
+    expect(document.querySelector(".cross-tab-card")?.textContent).toContain("From another tab");
+    const after=app.createProjectDocument();
+    before.tabs.forEach((tab,i)=>expect(after.tabs[i]).toMatchObject({...tab,world:expect.any(Object)}));
+  });
+  it("never counts references as prerequisites or detects cycles across tabs", () => {
+    const project=chapterProject(true);
+    project.tabs[1].references=[{id:"back",from:"A",toTabId:"chapter-1",toNodeId:"B",label:""}];
+    app.openGraphDocument(project,"chapters.depdoodle",false);
+    expect(app.analyzeGraph().topology.hasCycle).toBe(false);
+    expect(app.createGraphDocument().edges).toHaveLength(1);
+    app.switchGraphTab("chapter-2");
+    expect(app.analyzeGraph().roots.map(node=>node.id)).toEqual(["A"]);
+    const toggle=document.getElementById("simulate-toggle") as HTMLInputElement;
+    toggle.checked=true; toggle.dispatchEvent(new Event("change"));
+    expect(document.querySelector('[data-solve="A"]')).not.toBeNull();
+    expect(app.analyzeGraph().topology.hasCycle).toBe(false);
+  });
+  it("removes references from either endpoint and supports undo", () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    app.switchGraphTab("chapter-2"); chooseNode("A");
+    (document.querySelector("[data-remove-cross-reference]") as HTMLElement).click();
+    expect(app.createProjectDocument().tabs[0].references).toHaveLength(0);
+    click("undo-graph");
+    expect(app.createProjectDocument().tabs[0].references).toHaveLength(1);
+  });
+  it("cleans up remote references when deleting a node and restores them with undo", () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    app.switchGraphTab("chapter-2"); chooseNode("A"); click("delete-selection");
+    expect(app.createProjectDocument().tabs[0].references).toHaveLength(0);
+    click("undo-graph");
+    expect(app.createProjectDocument().tabs[0].references).toHaveLength(1);
+    expect(app.createGraphDocument().nodes).toHaveLength(2);
+  });
+  it("confirms tab deletion and restores its nodes and references through undo", async () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    app.switchGraphTab("chapter-2"); click("delete-graph-tab");
+    document.querySelector("dialog")!.close("cancel");
+    await Promise.resolve();
+    expect(app.createProjectDocument().tabs).toHaveLength(2);
+    click("delete-graph-tab"); document.querySelector("dialog")!.close("delete");
+    await vi.waitFor(()=>expect(app.createProjectDocument().tabs).toHaveLength(1));
+    expect(app.createProjectDocument().tabs[0].references).toHaveLength(0);
+    click("undo-graph");
+    expect(app.createProjectDocument().tabs).toHaveLength(2);
+    expect(app.createProjectDocument().tabs[0].references).toHaveLength(1);
+  });
+  it("exports only the active graph plus labeled reference cards", async () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    await app.ensureAutomaticRouting();
+    const raster=app.renderGraphToCanvas();
+    expect(raster.bounds.right).toBeGreaterThan(1070);
+    const blob=app.renderGraphToSvgBlob();
+    const svg=await new Promise<string>(resolve=>{const reader=new FileReader(); reader.onload=()=>resolve(String(reader.result)); reader.readAsText(blob);});
+    expect(svg).toContain("To another tab");
+    expect(svg).toContain("Unlock the observatory");
+    expect(svg).not.toContain("Watch the comet");
+  });
+  it("rejects duplicate tab IDs and missing reference endpoints on load", () => {
+    const project=chapterProject(true);
+    expect(()=>app.normalizeProjectDocument({...project,tabs:[project.tabs[0],project.tabs[0]]})).toThrow(/unique/);
+    project.tabs[0].references[0].toNodeId="missing";
+    expect(()=>app.normalizeProjectDocument(project)).toThrow(/Both elements must exist/);
+  });
+  it("escapes tab names, node titles, and reference labels", () => {
+    const project=chapterProject(true);
+    project.tabs[1].name='<img src=x onerror="alert(1)">';
+    project.tabs[1].nodes[0].title="<script>alert(1)</script>";
+    project.tabs[0].references[0].label='<img src=x onerror="alert(1)">';
+    app.openGraphDocument(project,"chapters.depdoodle",false);
+    expect(document.querySelector(".cross-tab-card img, #graph-tabs img, .cross-tab-card script")).toBeNull();
+    expect(document.querySelector(".cross-tab-card")?.textContent).toContain("<script>alert(1)</script>");
+  });
+});
+
+it("reroutes a cached tab when a new reference targets it", async () => {
+  app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+  app.switchGraphTab("chapter-2"); await app.ensureAutomaticRouting();
+  app.switchGraphTab("chapter-1"); await app.ensureAutomaticRouting();
+  app.addCrossTabReference("B","chapter-2","A"); await app.ensureAutomaticRouting();
+  routing.layout.mockClear();
+  app.switchGraphTab("chapter-2"); await app.ensureAutomaticRouting();
+  expect(routing.layout).toHaveBeenCalled();
+  expect(document.querySelector(".cross-tab-card")?.textContent).toContain("Chapter 1");
+});
+
+it("preserves zoom when undoing an edit within a tab", () => {
+  app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+  click("zoom-out"); const zoom=document.getElementById("zoom-level")?.textContent;
+  chooseNode("B"); edit("node-title","Changed");
+  (document.getElementById("node-title") as HTMLInputElement).dispatchEvent(new Event("change"));
+  click("undo-graph");
+  expect(document.getElementById("zoom-level")?.textContent).toBe(zoom);
+  expect(app.createGraphDocument().nodes[1].title).toBe("B");
+});
+
+it("edits reference labels from either tab and saves the change on the source tab", () => {
+  app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+  app.switchGraphTab("chapter-2"); chooseNode("A");
+  const label=document.querySelector<HTMLInputElement>("[data-reference-label]")!;
+  label.value="A changed label"; label.dispatchEvent(new Event("change",{bubbles:true}));
+  expect(app.createProjectDocument().tabs[0].references[0].label).toBe("A changed label");
+  expect(document.querySelector(".cross-tab-card")?.textContent).toContain("A changed label");
+  click("undo-graph");
+  expect(app.createProjectDocument().tabs[0].references[0].label).toBe("The brass key");
+});
+
+it("completes a pending project save across tab navigation while retaining subsequent edits", async () => {
+  native.enabled=true;
+  app.openGraphDocument(chapterProject(),"chapters.depdoodle",false,"/tmp/chapters.depdoodle");
+  let finish!:()=>void;
+  native.write.mockImplementation(()=>new Promise<void>(resolve=>{finish=resolve;}));
+  const save=app.saveGraph();
+  app.switchGraphTab("chapter-2");
+  chooseNode("A"); edit("node-title","Edited while saving another tab");
+  finish(); expect(await save).toBe(true);
+  expect(document.getElementById("save-status")?.textContent).toBe("Unsaved changes");
+  expect(JSON.parse(native.write.mock.calls[0][1]).tabs[1].nodes[0].title).toBe("Unlock the observatory");
+  expect(app.createProjectDocument().tabs[1].nodes[0].title).toBe("Edited while saving another tab");
+});
+
+it("uses the active tab name for exports", async () => {
+  native.enabled=true; native.save.mockResolvedValue(null);
+  app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+  app.switchGraphTab("chapter-2"); await app.ensureAutomaticRouting();
+  click("export-graph");
+  (document.querySelector('[data-export-format="svg"]') as HTMLElement).click();
+  await vi.waitFor(()=>expect(native.save).toHaveBeenCalled());
+  expect(native.save.mock.calls[0][0].defaultPath).toBe("chapters - Chapter 2.svg");
+});
+
+it("does not export a different tab after waiting for routing", async () => {
+  native.enabled=true; native.save.mockResolvedValue(null);
+  const router = routing.layout.getMockImplementation()!;
+  let finish!: (value: unknown)=>void;
+  let source="";
+  routing.layout.mockImplementationOnce((input:string)=>{source=input;return new Promise(resolve=>{finish=resolve;});});
+  app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+  await vi.waitFor(()=>expect(finish).toBeDefined());
+  click("export-graph"); (document.querySelector('[data-export-format="svg"]') as HTMLElement).click();
+  app.switchGraphTab("chapter-2");
+  finish(await router(source)); await app.ensureAutomaticRouting();
+  await Promise.resolve();
+  expect(native.save).not.toHaveBeenCalled();
+});
+
+const dragReferenceCard = (dx: number, dy: number, clickAfter = false) => {
+  const card=document.querySelector<HTMLElement>(".cross-tab-card")!;
+  card.dispatchEvent(new MouseEvent("pointerdown",{bubbles:true,button:0,clientX:20,clientY:20}));
+  window.dispatchEvent(new MouseEvent("pointermove",{clientX:20+dx,clientY:20+dy}));
+  window.dispatchEvent(new MouseEvent("pointerup"));
+  if (clickAfter) document.querySelector(".cross-tab-card")!.dispatchEvent(new MouseEvent("click",{bubbles:true,detail:1}));
+};
+
+describe("project and tab inspectors", () => {
+  it("starts new projects as Untitled Project and opens dedicated project settings from the centered title", async () => {
+    click("new-graph");
+    await vi.waitFor(()=>expect(app.createProjectDocument().title).toBe("Untitled Project"));
+    expect(document.getElementById("project-title-button")?.textContent).toBe("Untitled Project");
+    expect(document.getElementById("tab-name")).not.toBeNull();
+    expect(document.getElementById("chart-title")).toBeNull();
+    click("project-title-button");
+    expect(document.getElementById("inspector-heading")?.textContent).toBe("Project inspector");
+    expect(document.getElementById("tab-name")).toBeNull();
+    edit("chart-title","A new adventure");
+    edit("chart-description","A game about memory.");
+    expect(document.getElementById("project-title-button")?.textContent).toBe("A new adventure");
+    expect(document.getElementById("project-description-summary")?.textContent).toBe("A game about memory.");
+    (document.querySelector('[data-graph-tab="tab-1"]') as HTMLElement).click();
+    expect(document.getElementById("chart-title")).toBeNull();
+    expect(document.getElementById("tab-name")).not.toBeNull();
+    expect(document.getElementById("inspector-heading")?.textContent).toBe("Tab inspector");
+  });
+  it("stores separate descriptions for the project and each graph tab", () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    edit("tab-description","The arrival chapter");
+    app.switchGraphTab("chapter-2");
+    edit("tab-description","The observatory chapter");
+    edit("chart-description","Notes for the entire game");
+    const saved=app.createProjectDocument();
+    expect(saved.description).toBe("Notes for the entire game");
+    expect(saved.tabs.map(tab=>tab.description)).toEqual(["The arrival chapter","The observatory chapter"]);
+    app.openGraphDocument(saved,"chapters.depdoodle",false);
+    expect((document.getElementById("tab-description") as HTMLTextAreaElement).value).toBe("The arrival chapter");
+    app.switchGraphTab("chapter-2");
+    expect((document.getElementById("tab-description") as HTMLTextAreaElement).value).toBe("The observatory chapter");
+    expect(document.getElementById("chart-description")).toBeNull();
+    click("project-title-button");
+    expect((document.getElementById("chart-description") as HTMLTextAreaElement).value).toBe("Notes for the entire game");
+  });
+  it("keeps the project inspector active when undoing a project edit", () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    edit("chart-title","Changed project");
+    (document.getElementById("chart-title") as HTMLInputElement).dispatchEvent(new Event("change"));
+    click("undo-graph");
+    expect(document.getElementById("inspector-heading")?.textContent).toBe("Project inspector");
+    expect((document.getElementById("chart-title") as HTMLInputElement).value).toBe("An adventure");
+    expect(document.getElementById("project-title-button")?.textContent).toBe("An adventure");
+  });
+  it("switches from project settings to an element inspector when selecting a node", () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    click("project-title-button");
+    chooseNode("B");
+    expect(document.getElementById("inspector-heading")?.textContent).toBe("Node inspector");
+    expect(document.getElementById("chart-title")).toBeNull();
+    expect(document.getElementById("node-title")).not.toBeNull();
+  });
+});
+
+describe("reordering graph tabs", () => {
+  it("reorders tabs by dragging, keeps the active graph, and supports undo and redo", () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    const moving=document.querySelector('[data-graph-tab="chapter-2"]')!;
+    const target=document.querySelector('[data-graph-tab="chapter-1"]')!;
+    expect(moving.getAttribute("data-reorderable")).toBe("true");
+    vi.spyOn(target,"getBoundingClientRect").mockReturnValue({left:0,right:100,top:0,bottom:40,width:100,height:40} as DOMRect);
+    vi.spyOn(moving,"getBoundingClientRect").mockReturnValue({left:100,right:200,top:0,bottom:40,width:100,height:40} as DOMRect);
+    vi.spyOn(document.getElementById("graph-tabs")!,"getBoundingClientRect").mockReturnValue({left:0,right:200,top:0,bottom:40,width:200,height:40} as DOMRect);
+    moving.dispatchEvent(new MouseEvent("pointerdown",{bubbles:true,button:0,clientX:150,clientY:20}));
+    window.dispatchEvent(new MouseEvent("pointermove",{clientX:20,clientY:20}));
+    expect(target.classList.contains("drop-before")).toBe(true);
+    window.dispatchEvent(new MouseEvent("pointerup"));
+    expect(app.createProjectDocument().tabs.map(tab=>tab.id)).toEqual(["chapter-2","chapter-1"]);
+    expect(document.querySelector('[data-graph-tab="chapter-1"]')?.getAttribute("aria-selected")).toBe("true");
+    expect(app.createProjectDocument().tabs[1].references[0].toTabId).toBe("chapter-2");
+    click("undo-graph");
+    expect(app.createProjectDocument().tabs.map(tab=>tab.id)).toEqual(["chapter-1","chapter-2"]);
+    click("redo-graph");
+    expect(app.createProjectDocument().tabs.map(tab=>tab.id)).toEqual(["chapter-2","chapter-1"]);
+  });
+  it("offers keyboard tab reordering without navigating to another graph", () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    document.querySelector('[data-graph-tab="chapter-1"]')!.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowRight",altKey:true,bubbles:true}));
+    expect(app.createProjectDocument().tabs.map(tab=>tab.id)).toEqual(["chapter-2","chapter-1"]);
+    expect(document.querySelector('[data-graph-tab="chapter-1"]')?.getAttribute("aria-selected")).toBe("true");
+  });
+});
+
+describe("movable reference cards", () => {
+  it("moves a reference and its connector without navigating or moving graph nodes", async () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    await app.ensureAutomaticRouting();
+    const nodes=app.createGraphDocument().nodes;
+    const path=document.querySelector(".cross-tab-connector path")?.getAttribute("d");
+    dragReferenceCard(180,180,true);
+    await app.ensureAutomaticRouting();
+    expect(document.querySelector('[data-graph-tab="chapter-1"]')?.getAttribute("aria-selected")).toBe("true");
+    expect(app.createGraphDocument().nodes).toEqual(nodes);
+    const reference=app.createProjectDocument().tabs[0].references[0];
+    expect(reference.sourcePosition).toBeDefined();
+    expect(reference.targetPosition).toBeUndefined();
+    expect(document.querySelector(".cross-tab-connector path")?.getAttribute("d")).not.toBe(path);
+    const saved=app.createProjectDocument();
+    app.openGraphDocument(saved,"chapters.depdoodle",false);
+    expect((document.querySelector(".cross-tab-card") as HTMLElement).style.left).toBe(`${reference.sourcePosition!.x}px`);
+    expect((document.querySelector(".cross-tab-card") as HTMLElement).style.top).toBe(`${reference.sourcePosition!.y}px`);
+  });
+  it("remembers independent reference positions on either end of a link", async () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    dragReferenceCard(120,120);
+    const first=app.createProjectDocument().tabs[0].references[0].sourcePosition;
+    app.switchGraphTab("chapter-2");
+    dragReferenceCard(-300,240);
+    const saved=app.createProjectDocument();
+    expect(saved.tabs[0].references[0].sourcePosition).toEqual(first);
+    expect(saved.tabs[0].references[0].targetPosition).toBeDefined();
+    expect(saved.tabs[0].references[0].targetPosition).not.toEqual(first);
+    app.openGraphDocument(saved,"chapters.depdoodle",false);
+    app.switchGraphTab("chapter-2");
+    expect((document.querySelector(".cross-tab-card") as HTMLElement).style.top).toBe(`${saved.tabs[0].references[0].targetPosition!.y}px`);
+    await app.ensureAutomaticRouting();
+  });
+  it("undoes a reference drag as a single edit", () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    dragReferenceCard(240,120);
+    expect(app.createProjectDocument().tabs[0].references[0].sourcePosition).toBeDefined();
+    click("undo-graph");
+    expect(app.createProjectDocument().tabs[0].references[0].sourcePosition).toBeUndefined();
+    click("redo-graph");
+    expect(app.createProjectDocument().tabs[0].references[0].sourcePosition).toBeDefined();
+  });
+  it("still navigates on a click or tiny pointer movement", () => {
+    app.openGraphDocument(chapterProject(true),"chapters.depdoodle",false);
+    dragReferenceCard(1,1,true);
+    expect(document.querySelector('[data-graph-tab="chapter-2"]')?.getAttribute("aria-selected")).toBe("true");
+    expect(app.createProjectDocument().tabs[0].references[0].sourcePosition).toBeUndefined();
+  });
+});
+
+it("switches tabs on an ordinary pointer click without reordering them", () => {
+  app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+  const tab=document.querySelector('[data-graph-tab="chapter-2"]')!;
+  tab.dispatchEvent(new MouseEvent("pointerdown",{bubbles:true,button:0,clientX:150,clientY:20}));
+  window.dispatchEvent(new MouseEvent("pointerup"));
+  expect(document.querySelector('[data-graph-tab="chapter-2"]')?.getAttribute("aria-selected")).toBe("true");
+  expect(app.createProjectDocument().tabs.map(tab=>tab.id)).toEqual(["chapter-1","chapter-2"]);
+  expect(document.getElementById("save-status")?.textContent).toBe("Saved");
+  expect(document.getElementById("rename-graph-tab")).toBeNull();
+  expect(document.getElementById("inspector-heading")?.textContent).toBe("Tab inspector");
+  expect((document.getElementById("tab-name") as HTMLInputElement).value).toBe("Chapter 2");
+});
+
+it("cancels a tab drag without changing the project order", () => {
+  app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+  const tab=document.querySelector('[data-graph-tab="chapter-2"]')!;
+  tab.dispatchEvent(new MouseEvent("pointerdown",{bubbles:true,button:0,clientX:150,clientY:20}));
+  window.dispatchEvent(new MouseEvent("pointermove",{clientX:20,clientY:20}));
+  window.dispatchEvent(new Event("pointercancel"));
+  window.dispatchEvent(new MouseEvent("pointerup"));
+  expect(app.createProjectDocument().tabs.map(tab=>tab.id)).toEqual(["chapter-1","chapter-2"]);
+  expect(document.getElementById("save-status")?.textContent).toBe("Saved");
+});
+
+describe("node corner resizing", () => {
+  const box = () => document.querySelector<HTMLElement>('.node[data-node-id="A"]')!;
+  const current = () => app.createGraphDocument().nodes.find(node => node.id === "A")!;
+  const handle = (corner = "se") => box().querySelector<HTMLButtonElement>(`.resize-${corner}`)!;
+  const pointer = (type: string, x = 0, y = 0) => new MouseEvent(type, {bubbles:true,button:0,clientX:x,clientY:y});
+  const select = () => { box().dispatchEvent(pointer("pointerdown",210,210)); window.dispatchEvent(pointer("pointerup")); };
+  const move = (x: number, y: number) => window.dispatchEvent(pointer("pointermove",x,y));
+  const release = () => window.dispatchEvent(pointer("pointerup"));
+  beforeEach(async () => {
+    app.openGraphDocument({...graph(), nodes:[{...node("A",200),y:200},node("B",650)],
+      groups:[{id:"act",name:"Act",color:"#549aa3",hidden:false,nodeIds:["A"]}]},"resize.depdoodle",false);
+    if (document.getElementById("snap-grid")!.getAttribute("aria-pressed") === "true") click("snap-grid");
+    await app.ensureAutomaticRouting(); routing.layout.mockClear();
+    select();
+  });
+
+  it("shows four handles only on selected nodes in the select tool", () => {
+    expect(box().querySelectorAll(".node-resize-handle")).toHaveLength(4);
+    expect(document.querySelector('.node[data-node-id="B"] .node-resize-handle')).toBeNull();
+    click("tool-connect");
+    expect(document.querySelectorAll(".node-resize-handle")).toHaveLength(0);
+  });
+
+  it.each([
+    ["nw",-60,-40,{x:140,y:160,width:270,height:158}],
+    ["ne",60,-40,{x:200,y:160,width:270,height:158}],
+    ["sw",-60,40,{x:140,y:200,width:270,height:158}],
+    ["se",60,40,{x:200,y:200,width:270,height:158}],
+  ] as const)("resizes from %s while keeping the opposite corner fixed", (corner,dx,dy,expected) => {
+    const other = app.createGraphDocument().nodes[1];
+    handle(corner).dispatchEvent(pointer("pointerdown",400,300));
+    move(400+dx,300+dy); release();
+    expect(current()).toMatchObject(expected);
+    expect(app.createGraphDocument().nodes[1]).toEqual(other);
+  });
+
+  it("updates the node, group and automatic connector live and keeps the route on release", async () => {
+    const beforePath = document.querySelector(".edge-path")!.getAttribute("d");
+    const beforeGroup = document.querySelector(".group-box")!.getAttribute("style");
+    const originalBox = box();
+    const originalHandle = handle();
+    originalHandle.dispatchEvent(pointer("pointerdown",410,318));
+    move(510,368);
+    expect(box()).toBe(originalBox);
+    expect(handle()).toBe(originalHandle);
+    expect(box().style.width).toBe("310px");
+    expect(box().style.height).toBe("168px");
+    expect(document.querySelector(".group-box")!.getAttribute("style")).not.toBe(beforeGroup);
+    await new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()));
+    await app.ensureAutomaticRouting();
+    const preview = document.querySelector(".edge-path")!.getAttribute("d");
+    expect(preview).not.toBe(beforePath);
+    release(); await app.ensureAutomaticRouting();
+    expect(document.querySelector(".edge-path")!.getAttribute("d")).toBe(preview);
+    expect(routing.layout).toHaveBeenCalledOnce();
+    expect(app.createGraphDocument().edges[0].manualRoute).toBeUndefined();
+  });
+
+  it("saves larger sizes through reload and treats a gesture as one undoable edit", () => {
+    const before = app.createGraphDocument();
+    handle().dispatchEvent(pointer("pointerdown",410,318));
+    move(600,450); move(1000,600); release();
+    const resized = app.createGraphDocument();
+    expect(current()).toMatchObject({width:800,height:400});
+    click("undo-graph"); expect(app.createGraphDocument().nodes).toEqual(before.nodes);
+    click("redo-graph"); expect(app.createGraphDocument().nodes).toEqual(resized.nodes);
+    const saved = app.createProjectDocument();
+    app.openGraphDocument(saved,"resize.depdoodle",false);
+    expect(app.createProjectDocument()).toEqual(saved);
+  });
+
+  it("preserves hand-edited connector bends while reattaching them to the resized box", () => {
+    const manualRoute = [{x:410,y:259},{x:520,y:259},{x:520,y:159},{x:650,y:159}];
+    app.openGraphDocument({...graph(),nodes:[{...node("A",200),y:200},node("B",650)],
+      edges:[{...graph().edges[0],manualRoute}]},"manual.depdoodle",false);
+    select();
+    handle().dispatchEvent(pointer("pointerdown",410,318));
+    move(460,358); release();
+    expect(app.createGraphDocument().edges[0].manualRoute).toEqual(manualRoute);
+    expect(document.querySelector(".edge-path")!.getAttribute("d")).toContain("M 460");
+  });
+
+  it.each(["pointercancel","Escape"])("restores the original size on %s without adding history", (cancel) => {
+    const before = app.createGraphDocument();
+    handle("nw").dispatchEvent(pointer("pointerdown",200,200));
+    move(140,160);
+    if (cancel === "Escape") document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true}));
+    else window.dispatchEvent(pointer("pointercancel"));
+    move(120,120); release();
+    expect(app.createGraphDocument().nodes).toEqual(before.nodes);
+    expect(document.getElementById("save-status")?.textContent).toBe("Saved");
+    expect((document.getElementById("undo-graph") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("does not resize or dirty the graph when a handle is only clicked", () => {
+    click("snap-grid");
+    const before = app.createGraphDocument();
+    handle().dispatchEvent(pointer("pointerdown",410,318));
+    move(410,318); release();
+    expect(app.createGraphDocument()).toEqual(before);
+    expect(document.getElementById("save-status")?.textContent).toBe("Saved");
+  });
+
+  it("snaps the moving corner to the grid without shifting its anchor", () => {
+    click("snap-grid");
+    handle("nw").dispatchEvent(pointer("pointerdown",200,200));
+    move(150,150); release();
+    expect(current()).toMatchObject({x:144,y:144,width:266,height:174});
+  });
+
+  it("converts screen movement into graph coordinates at the current zoom", () => {
+    click("zoom-in");
+    handle().dispatchEvent(pointer("pointerdown",400,300));
+    move(460,330); release();
+    expect(current()).toMatchObject({x:200,y:200,width:260,height:143});
+  });
+
+  it("stops at the minimum size without flipping the node", () => {
+    handle("nw").dispatchEvent(pointer("pointerdown",200,200));
+    move(1000,1000); release();
+    expect(current()).toMatchObject({x:250,y:234,width:160,height:84});
+  });
+
+  it("supports keyboard resizing without changing the other dimension", () => {
+    handle().focus();
+    handle().dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowRight",bubbles:true}));
+    expect(current()).toMatchObject({width:211,height:118});
+    expect(document.activeElement).toBe(handle());
+    click("snap-grid");
+    handle().dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true}));
+    expect(current()).toMatchObject({width:211,height:136});
+  });
+
+  it("cancels resize listeners when switching graph tabs", () => {
+    app.openGraphDocument(chapterProject(),"chapters.depdoodle",false);
+    select();
+    handle().dispatchEvent(pointer("pointerdown",300,200));
+    move(400,300);
+    app.switchGraphTab("chapter-2");
+    const otherTab = app.createGraphDocument();
+    move(700,600); release();
+    expect(app.createGraphDocument()).toEqual(otherTab);
+  });
+});
+
+describe("auto layout with cross-tab reference cards", () => {
+  const card = () => {
+    const element = document.querySelector<HTMLElement>(".cross-tab-card")!;
+    return {x:parseFloat(element.style.left),y:parseFloat(element.style.top),
+      width:parseFloat(element.style.width),height:parseFloat(element.style.height)};
+  };
+  const overlaps = (a: {x:number;y:number;width:number;height:number}, b: {x:number;y:number;width:number;height:number}) =>
+    a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+
+  it.each(["outgoing", "incoming"] as const)("arranges %s cards with the nodes and saves only the active end", async direction => {
+    const project = app.normalizeProjectDocument(chapterProject(true));
+    const reference = project.tabs[0].references[0];
+    reference.sourcePosition = {x:464,y:164};
+    reference.targetPosition = {x:64,y:164};
+    app.openGraphDocument(project,"reference-layout.depdoodle",false);
+    if (direction === "incoming") app.switchGraphTab("chapter-2");
+    await app.ensureAutomaticRouting();
+    const otherNodes = app.createProjectDocument().tabs[direction === "incoming" ? 0 : 1].nodes;
+    routing.layout.mockClear();
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await window.__depdoodleDebug!.autoLayout();
+    await app.ensureAutomaticRouting();
+    const positioned = card();
+    expect(app.createGraphDocument().nodes.every(node => !overlaps(node, positioned))).toBe(true);
+    const saved = app.createProjectDocument();
+    const savedReference = saved.tabs[0].references[0];
+    expect(direction === "incoming" ? savedReference.targetPosition : savedReference.sourcePosition)
+      .toEqual({x:positioned.x,y:positioned.y});
+    expect(direction === "incoming" ? savedReference.sourcePosition : savedReference.targetPosition)
+      .toEqual(direction === "incoming" ? reference.sourcePosition : reference.targetPosition);
+    expect(saved.tabs[direction === "incoming" ? 0 : 1].nodes).toEqual(otherNodes);
+    expect(app.createGraphDocument().nodes).toHaveLength(2);
+    expect(app.createGraphDocument().edges).toHaveLength(1);
+    const autoCall = routing.layout.mock.calls.find(call => !call[0].includes("left:"))!;
+    expect(autoCall[0]).toContain("width: 240; height: 92");
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("reference cards"));
+    expect(app.analyzeGraph().topology.hasCycle).toBe(false);
+    expect(routing.layout).toHaveBeenCalledOnce();
+    app.openGraphDocument(saved,"reference-layout.depdoodle",false);
+    if (direction === "incoming") app.switchGraphTab("chapter-2");
+    await app.ensureAutomaticRouting();
+    expect(card()).toEqual(positioned);
+  });
+
+  it("undoes and redoes node and reference positions together", async () => {
+    app.openGraphDocument(chapterProject(true),"reference-layout.depdoodle",false);
+    await app.ensureAutomaticRouting();
+    const before = app.createProjectDocument(), oldCard = card();
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await window.__depdoodleDebug!.autoLayout();
+    const after = app.createProjectDocument(), newCard = card();
+    expect(after.tabs[0].references[0].sourcePosition).toBeDefined();
+    click("undo-graph"); await app.ensureAutomaticRouting();
+    expect(app.createProjectDocument().tabs[0].nodes).toEqual(before.tabs[0].nodes);
+    expect(app.createProjectDocument().tabs[0].references).toEqual(before.tabs[0].references);
+    expect(card()).toEqual(oldCard);
+    click("redo-graph"); await app.ensureAutomaticRouting();
+    expect(app.createProjectDocument().tabs[0].nodes).toEqual(after.tabs[0].nodes);
+    expect(app.createProjectDocument().tabs[0].references).toEqual(after.tabs[0].references);
+    expect(card()).toEqual(newCard);
+  });
+
+  it("keeps manually placed references and nodes unchanged when layout is canceled", async () => {
+    app.openGraphDocument(chapterProject(true),"reference-layout.depdoodle",false);
+    dragReferenceCard(-500,120);
+    await app.ensureAutomaticRouting();
+    const before = app.createProjectDocument();
+    routing.layout.mockClear();
+    await window.__depdoodleDebug!.autoLayout();
+    expect(app.createProjectDocument()).toEqual(before);
+    expect(routing.layout).not.toHaveBeenCalled();
   });
 });

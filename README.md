@@ -21,18 +21,21 @@ from the dependency graph.
 [Download the latest release](https://github.com/Fulviuus/depdoodle/releases/latest)
 for Windows, macOS, or Linux.
 
-## New in 0.2.0
+## New in 0.3.0
 
-- D2/TALA replaces Graphviz for connection routing and confirmed automatic layout.
-  Connections update as boxes move; existing box positions stay under your control.
-- Checks can be selected together, with glowing matches and the rest of the chart
-  faded to 20% opacity.
-- Interactive playthrough adds Solve/Undo controls, completion crosses, and
-  animated connections to the next available puzzles.
-- AND/OR prerequisites, narrative checks, search, and prerequisite/unlock focus
-  help inspect the structure of larger charts.
-- More reliable saving, recovery, recent files, and closing protect editing work.
-- Refreshed logos and application icons support light and dark themes.
+- Keep chapters in separate graph tabs within one project. Drag tabs to reorder
+  them and edit each tab's name and description in its inspector.
+- Link elements across tabs with movable reference cards and dashed connectors.
+  Each end remembers its own position; click a card to visit the other tab.
+- Click the centered project title to edit project details separately from the
+  active tab. New projects start as **Untitled Project**.
+- Resize nodes with four corner handles, with live connector updates, grid
+  snapping, keyboard adjustments, undo/redo, and Escape to cancel.
+- New nodes and their placement previews use grid-aligned 216 × 120 dimensions.
+- Confirmed Auto Layout arranges nodes and reference cards together to avoid
+  overlaps. Checks and playthrough simulation remain local to each tab.
+- Version 1 files still open with their existing geometry. Saving writes format
+  version 2, which requires DepDoodle 0.3.0 or later.
 
 ## Screenshots
 
@@ -71,11 +74,18 @@ The longer design memo lives in
 
 ## Core Features
 
-- **Welcome screen**: create a new graph, load a `.depdoodle` file, or reopen a
+- **Graph tabs**: keep chapters or other sections in separate graphs within one
+  project file. Create, reorder, rename, and delete tabs; undo also restores deleted tabs.
+- **Cross-tab references**: link a puzzle to an element in another tab. Dashed
+  connectors and labeled “other tab” cards show where the reference leads;
+  click a card to jump there. References are visible from either end.
+- **Welcome screen**: create a new project, open a `.depdoodle` file, or reopen a
   recent graph.
-- **Visible file metadata**: edit the chart name and description from the
-  inspector when nothing is selected.
-- **Puzzle nodes**: create and edit puzzle, gate, and reward nodes.
+- **Project and tab details**: click the centered project title to edit the
+  project name and description. Select a tab to edit that tab's name and description.
+- **Puzzle nodes**: create and edit puzzle, gate, and reward nodes. Select a node
+  and drag any corner handle to resize it; connectors follow automatically.
+  Resizing respects grid snapping, supports undo/redo, and can be canceled with Escape.
 - **Node details**: title, memo, optional difficulty, kind, color, incoming
   count, outgoing count, role, prerequisites, unlocks, and safe narrative
   context.
@@ -93,15 +103,17 @@ The longer design memo lives in
   restore the normal chart.
 - **Branch width chart**: quick view of how many nodes sit in each dependency
   layer.
-- **Auto Layout**: D2/TALA automatic box layout, with explicit
-  confirmation before moving nodes and replacing connector routes and labels.
+- **Auto Layout**: D2/TALA arranges nodes and cross-tab reference cards together
+  to prevent overlaps, with explicit confirmation before moving them and
+  replacing connector routes and labels.
 - **Routing**: automatic D2/TALA connection routing on load and after
   graph edits, including live previews while dragging boxes. The preview and
   release use the same router; manual connector and label overrides are preserved.
   Routing keeps every node at its saved position. Inspecting checks or switching views does not
   rearrange boxes or recalculate connection routes.
 - **Zoom controls**: zoom in, zoom out, reset, and fit chart to view.
-- **Snap to grid**: optional grid snapping for node and group movement.
+- **Snap to grid**: optional grid snapping for node placement, resizing, group
+  movement, and reference cards. New nodes are sized to match the grid.
 - **Multiple selection**: box-select or modifier-select nodes, then drag or
   group them.
 - **Undo/redo**: multi-step history for graph edits.
@@ -126,10 +138,42 @@ The longer design memo lives in
 
 ## Main Views
 
+### Graph Tabs
+
+The tab bar above the workspace separates graphs within a project. Use **+** to
+add a graph. Drag tabs to reorder them, or use **Alt + Left/Right** with a tab
+focused. Selecting a tab opens its inspector, with separate
+**Tab name** and **Tab description** fields. **Delete tab…**
+asks for confirmation and can be undone. Save writes every tab to the same
+`.depdoodle` file. Switching tabs keeps their zoom, selection, search, and
+playthrough state for the current session.
+
+The project name is centered above the graph and starts as **Untitled Project**.
+Click it to open the dedicated project inspector, where you can edit the project
+name and description. Project details are separate from tab details.
+
+To connect chapters, select a puzzle and use **Other tabs** in the inspector.
+Choose an element, optionally add a label, and click **Add reference**. Each end
+shows a dashed connector to a card naming the other tab and puzzle. Click that
+card, or its inspector link, to visit the target. Drag a reference card to
+reposition it; its connector follows automatically. Each end keeps its own
+position, saved with the project. Reference labels can be edited and links
+removed from either end.
+
+Checks, dependency layers, and playthrough simulation operate
+only on the active tab's own nodes and dependency arrows. Cross-tab references
+are navigation links; they do not add prerequisites or create cycles between
+chapters. Deleting a tab or node also removes its incident references, and undo
+restores them.
+
+Auto Layout includes the active tab's reference cards as visual endpoints, so
+nodes and cards do not overlap. It saves each card's new position on that tab;
+the other end in another tab stays where it was. Undo restores the entire layout.
+
 ### Welcome
 
 The welcome screen is the project entry point. It shows the product logo,
-creates new graphs, loads existing `.depdoodle` files, and lists recent files.
+creates new projects, opens existing `.depdoodle` files, and lists recent files.
 Recent items can be removed individually or cleared as a group.
 
 Recent entries are stored locally. In the desktop app, reopening a recent file
@@ -163,6 +207,15 @@ connection and label overrides take precedence over automatic routing.
 Use **Node** to place puzzle nodes. Use **Connect** to click one node and then
 another, creating a dependency. Use **Select** to move nodes, select groups, drag
 routes, or edit labels.
+
+Selected nodes have four corner handles. Drag a handle to resize the node while
+keeping the opposite corner fixed; connected arrows update as you drag. With a
+handle focused, use the arrow keys to resize by a grid step, or by one pixel
+when snapping is off (**Shift** uses ten pixels). Press **Escape** during a drag
+to cancel it. Resizing is saved with the project and supports undo/redo.
+
+New nodes and their placement previews are 216 × 120, a whole number of grid
+cells. Existing nodes retain their saved sizes.
 
 ### Pacing
 
@@ -203,7 +256,8 @@ restores the normal chart; enabling it again resumes the current playthrough.
 
 The inspector edits whatever is selected:
 
-- **Nothing selected**: chart name, chart description, file name, and contents.
+- **Project title selected**: project name, project description, file name, and project contents.
+- **Nothing selected / tab selected**: tab name, tab description, and tab contents.
 - **One node selected**: node semantics and relationships.
 - **Multiple nodes selected**: selection summary, create group, or delete nodes.
 - **Group selected**: group name, color, visibility, ungroup, or delete group
@@ -219,23 +273,39 @@ should not rely on hidden chart meaning.
 DepDoodle projects use the `.depdoodle` extension. The contents are versioned
 JSON so they are easy to inspect, diff, recover, and transform.
 
-Current format:
+Current format (version 2):
 
 ```json
 {
   "format": "depdoodle.graph",
-  "version": 1,
-  "title": "Basement Door Puzzle Study",
-  "description": "Optional visible project notes.",
-  "world": {
-    "width": 1500,
-    "height": 900
-  },
-  "nodes": [],
-  "edges": [],
-  "groups": []
+  "version": 2,
+  "title": "An adventure",
+  "description": "Project notes.",
+  "tabs": [
+    {
+      "id": "chapter-1",
+      "name": "Chapter 1",
+      "description": "The arrival chapter.",
+      "world": { "width": 1680, "height": 1040 },
+      "nodes": [],
+      "edges": [],
+      "groups": [],
+      "references": []
+    }
+  ]
 }
 ```
+
+Each tab owns its nodes, edges, groups, and canvas dimensions. Node IDs need to
+be unique only within their tab. A cross-tab reference is stored on its source
+tab with `id`, `from`, `toTabId`, `toNodeId`, and `label` fields. `from` is a local
+node ID; the destination identifies a node in another tab. Optional
+`sourcePosition` and `targetPosition` coordinates preserve each reference card’s
+placement in its respective tab.
+
+Version 1 projects open as a single tab without moving their boxes or changing
+manual connection routes. Saving uses version 2, which requires DepDoodle 0.3.0
+or later; version 0.2.x cannot open the new project format.
 
 ### Node Fields
 
@@ -288,7 +358,7 @@ When saved again, the project uses visible groups and no hidden `act` fields.
 
 ## Export
 
-DepDoodle can export the visible chart as:
+DepDoodle exports the active tab, including its cross-tab reference cards, as:
 
 - PNG
 - JPG
@@ -393,9 +463,10 @@ available at [d2lang/d2](https://github.com/d2lang/d2/tree/v0.9.0).
 The native helper avoids a WebKit WebAssembly worker stack limit. The browser
 frontend uses the WASM package and requires a compatible browser.
 
-The tests cover real D2 routing, fixed box positions, drag previews, check
-highlighting, cycles, unsaved changes, recovery, native save/open behavior,
-exports, simulation, prerequisite rules, narrative references, and focus views.
+The tests cover real D2 routing, fixed box positions, drag previews, resizing,
+check highlighting, graph tabs, cross-tab references, layout collisions, cycles,
+unsaved changes, recovery, native save/open behavior, exports, simulation,
+prerequisite rules, narrative references, and focus views.
 
 Create a production Tauri build:
 
